@@ -14,7 +14,7 @@ use std::sync::mpsc::channel;
 use std::time::Duration;
 use std::ops::Index;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, Ordering, ATOMIC_USIZE_INIT};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use monome::{Monome, MonomeEvent, KeyDirection};
 
@@ -93,7 +93,8 @@ struct MLRTrackMetadata
     start_index: usize, // [0, 15]
     stop_index: usize, // [0, 15], strictly greater than start
     direction: PlaybackDirection,
-    frames: usize
+    frames: usize,
+    name: String
 }
 
 impl MLRTrackMetadata
@@ -125,28 +126,26 @@ impl MLRTrackMetadata
         self.stop_index = index;
     }
     fn set_head(&mut self, index: usize) {
-        println!("set_head: {}", index);
         self.current_pos = self.index_to_frames(index);
-        println!("current_pos: {}", self.current_pos);
     }
     fn set_direction(&mut self,direction: PlaybackDirection) {
         self.direction = direction;
     }
     fn frames_to_index(&self, frames: usize) -> usize {
-      //  println!("{} * 16 / {} = {}", frames, self.frames, frames * 16 / self.frames);
         frames * 16 / self.frames
     }
     fn index_to_frames(&self, index: usize) -> usize{
-        // println!("{} / 16 * {} = {}", self.frames, index, (self.frames / 16) * index);
         (self.frames / 16) * index
     }
     fn current_led(&self) -> usize {
         let c = self.frames_to_index(self.current_pos);
-       // println!("current: {}", c);
         c
     }
     fn row_index(&self) -> usize {
         self.row_index
+    }
+    fn name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -171,7 +170,8 @@ impl MLRTrack
             start_index: 0,
             stop_index: 16,
             frames: self.sample.frames(),
-            direction: PlaybackDirection::FORWARD
+            direction: PlaybackDirection::FORWARD,
+            name: self.name().clone().to_string()
         }
     }
     fn start(&mut self) {
@@ -298,6 +298,97 @@ fn validate_files(files: &Vec<MLRSample>) -> bool {
     return true;
 }
 
+#[derive(Clone, PartialEq)]
+enum MLRIntent
+{
+    Nothing,
+    Trigger,
+    Loop
+}
+
+enum MLRAction
+{
+    Nothing,
+    Trigger((usize, usize)),
+    Loop((usize, usize, usize))
+}
+
+struct GridStateTracker {
+    buttons: Vec<MLRIntent>,
+    width: usize,
+    height: usize
+}
+
+
+// state tracker for grid action on the botton rows
+impl GridStateTracker {
+    fn new(width: usize, height: usize) -> GridStateTracker {
+      GridStateTracker {
+          width,
+          height,
+          buttons: vec![MLRIntent::Nothing; width * height]
+      }
+    }
+    fn down(&mut self, x: usize, y: usize) {
+      // If, when pressing down, we find another button on the same line already down, this is a
+      // loop.
+      let mut foundanother = false;
+      for i  in 0..self.width {
+          if self.buttons[Self::idx(self.width, i, y)] != MLRIntent::Nothing {
+              self.buttons[Self::idx(self.width, i, y)] = MLRIntent::Loop;
+              self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Loop;
+              foundanother = true;
+          }
+      }
+      if !foundanother {
+          self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Trigger;
+      }
+    }
+    fn up(&mut self, x: usize, y: usize) -> MLRAction {
+        match self.buttons[Self::idx(self.width, x, y)].clone() {
+            MLRIntent::Nothing => { panic!("what."); }
+            MLRIntent::Trigger => {
+                self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Nothing;
+                MLRAction::Trigger((x ,y))
+            }
+            MLRIntent::Loop => {
+                // Find the other button that is down, if we find one that if intended for looping,
+                // loop between the two points. Otherwise, it's just the second loop point that is
+                // being released.
+                let mut other: Option<usize> = None;
+                for i in 0..self.width {
+                    if i != x && self.buttons[Self::idx(self.width, i, y)] == MLRIntent::Loop {
+                        other = Some(i);
+                    }
+                }
+
+                self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Nothing;
+
+                match other {
+                    Some(i) => MLRAction::Loop((y, x, i)),
+                    None => MLRAction::Nothing
+                }
+            }
+        }
+    }
+    fn idx(width: usize, x: usize, y: usize) -> usize {
+      y * width + x
+    }
+    fn dump(&self) {
+        for i in 0..self.height {
+            for j in 0..self.width {
+                match self.buttons[Self::idx(self.width, j, i)] {
+                    MLRIntent::Nothing => { print!(" "); }
+                    MLRIntent::Trigger => { print!("T"); }
+                    MLRIntent::Loop => { print!("L"); }
+                }
+            }
+            println!(" ");
+        }
+    }
+}
+
+#[derive(Debug)]
 enum Message {
     Enable(i32),
     Disable(i32),
@@ -379,9 +470,11 @@ fn main() {
                               info!("setting head for {} at {}", tracks[track as usize].name(), pos);
                           }
                           Message::SetStart((track, pos)) => {
+                              info!("setting start point for {} at {}", tracks[track as usize].name(), pos);
                               tracks[track as usize].set_start(pos);
                           }
                           Message::SetEnd((track, pos)) => {
+                              info!("setting end point for {} at {}", tracks[track as usize].name(), pos);
                               tracks[track as usize].set_stop(pos);
                           }
                           _ => {
@@ -418,7 +511,6 @@ fn main() {
 
     let stream = builder.init(&ctx).expect("Failed to create cubeb stream");
 
-
     let mut monome = Monome::new("/mlr-rs").unwrap();
 
     stream.start().unwrap();
@@ -431,6 +523,7 @@ fn main() {
     let mut prev_clock = 0;
 
     let mut leds: Vec<i32> = vec![-1; 7];
+    let mut state_tracker = GridStateTracker::new(monome.width(), monome.height());
 
     loop {
         loop {
@@ -440,12 +533,7 @@ fn main() {
                         KeyDirection::Down => {
                             match y {
                                 1...8 => {
-                                    let track_index = y - 1; // offset the control row
-                                    tracks_meta[track_index as usize].start();
-                                    tracks_meta[track_index as usize].set_head(x as usize);
-                                    monome.set(y - 1 as i32, 0, true);
-                                    sender.send(Message::Enable(y as i32 - 1)).unwrap();
-                                    sender.send(Message::SetHead((y as u32 - 1, x as u32)));
+                                    state_tracker.down(x as usize, y as usize);
                                 }
                                 _ => {
                                     // nothing to do on key up for control row
@@ -472,6 +560,29 @@ fn main() {
                                         // not implemented
                                     }
                                 }
+                            } else {
+                                match state_tracker.up(x as usize, y as usize) {
+                                    MLRAction::Trigger((x, y)) => {
+                                        let track_index = y - 1;
+                                        tracks_meta[track_index as usize].start();
+                                        tracks_meta[track_index as usize].set_head(x as usize);
+                                        monome.set((y - 1) as i32, 0, true);
+                                        sender.send(Message::Enable((y - 1) as i32)).unwrap();
+                                        sender.send(Message::SetHead(((y - 1) as u32, x as u32))).unwrap();
+                                    }
+                                    MLRAction::Loop((row, mut start, mut end)) => {
+                                        let track_index = row - 1;
+                                        if start > end {
+                                            std::mem::swap(&mut start, &mut end);
+                                        }
+                                        sender.send(Message::SetStart(((y - 1) as u32, start as u32))).unwrap();
+                                        sender.send(Message::SetEnd(((y - 1) as u32, end as u32))).unwrap();
+                                        tracks_meta[track_index as usize].set_start(start as usize);
+                                        tracks_meta[track_index as usize].set_stop(end as usize);
+                                    }
+                                    MLRAction::Nothing => {
+                                    }
+                                }
                             }
                         }
 
@@ -485,7 +596,6 @@ fn main() {
                 }
             }
         }
-        /// println!("{}", clock_receiver.beat());
         let current_time = clock_receiver.raw_frames();
         let diff = current_time - prev_clock;
         for t in tracks_meta.iter_mut() {
