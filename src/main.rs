@@ -1,16 +1,22 @@
-use std::fs;
-use std::fs::DirEntry;
-use std::env;
-use std::cmp;
-use std::thread;
-use std::time::Duration;
-use std::ops::Index;
-
 extern crate audrey;
 extern crate pretty_env_logger;
 #[macro_use]
 extern crate log;
 extern crate cubeb;
+extern crate monome;
+
+use std::fs;
+use std::fs::DirEntry;
+use std::env;
+use std::cmp;
+use std::thread;
+use std::sync::mpsc::channel;
+use std::time::Duration;
+use std::ops::Index;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering, ATOMIC_USIZE_INIT};
+
+use monome::{Monome, MonomeEvent, KeyDirection};
 
 struct MLRSample
 {
@@ -104,6 +110,9 @@ impl MLRTrack
     fn set_stop(&mut self, index: u32) {
         self.stop_index = index;
     }
+    fn set_head(&mut self, index: u32) {
+        self.current_pos = Self::index_to_frames(&self.sample, index);
+    }
     fn set_direction(&mut self,direction: PlaybackDirection) {
         self.direction = direction;
     }
@@ -154,6 +163,38 @@ impl<'a> Mixer<'a> {
   }
 }
 
+
+struct ClockUpdater {
+    clock: Arc<AtomicUsize>
+}
+
+impl ClockUpdater {
+    fn increment(&mut self, frames: usize) {
+        self.clock.store(self.clock.load(Ordering::Relaxed) + frames, Ordering::Relaxed);
+    }
+}
+
+struct ClockConsumer {
+    clock: Arc<AtomicUsize>,
+    rate: u32,
+    tempo: f32
+}
+
+impl ClockConsumer {
+    fn raw_frames(&self) -> usize {
+        self.clock.load(Ordering::Relaxed)
+    }
+    fn beat(&self) -> f32 {
+        self.tempo / 60. * (self.raw_frames() as f32 / self.rate as f32)
+    }
+}
+
+fn clock(tempo: f32, rate: u32) -> (ClockUpdater, ClockConsumer) {
+    let c = Arc::new(AtomicUsize::new(0));
+    (ClockUpdater { clock: c.clone() }, ClockConsumer { clock: c, tempo, rate })
+}
+
+
 fn usage() {
   println!("USAGE: mlr-rs <directory containing samples>");
 }
@@ -176,6 +217,14 @@ fn validate_files(files: &Vec<MLRSample>) -> bool {
         }
     }
     return true;
+}
+
+enum Message {
+    Enable(i32),
+    Disable(i32),
+    SetHead((u32, u32)),
+    SetStart((u32, u32)),
+    SetEnd((u32, u32))
 }
 
 fn main() {
@@ -204,11 +253,15 @@ fn main() {
 
     let mut tracks: Vec<MLRTrack> = Vec::new();
     let mut row = 0;
-    for i in 0..samples.len() {
+    for _i in 0..samples.len() {
       let s = samples.remove(0);
       tracks.push(MLRTrack::new(row, s));
       row += 1;
     }
+
+    let (sender, receiver) = channel();
+    let (mut clock_updater, clock_receiver) = clock(128., 48000);
+    let rx = Arc::new(Mutex::new(receiver));
 
     // set up audio output
     let ctx = cubeb::init("mlr-rs").expect("Failed to create cubeb context");
@@ -219,21 +272,50 @@ fn main() {
         .layout(cubeb::ChannelLayout::MONO)
         .take();
 
-    let mut position = 0u32;
-
     let mut buf = vec![0.0 as f32; 256];
-    tracks[0].start();
-    tracks[1].start();
-    // tracks[2].start();
-    tracks[3].start();
-    tracks[4].start();
 
     let mut builder = cubeb::StreamBuilder::new();
     builder
         .name("mlr-rs")
         .default_output(&params)
         .latency(256)
-        .data_callback(move |input: &[f32], output| {
+        .data_callback(move |_input: &[f32], output| {
+            loop {
+                match rx.lock().unwrap().try_recv() {
+                  Ok(msg) => {
+                      match msg {
+                          Message::Enable(track) => {
+                              tracks[track as usize].start();
+                          }
+                          Message::Disable(track) => {
+                              tracks[track as usize].stop();
+                          }
+                          Message::SetHead((track, pos)) => {
+                              tracks[track as usize].set_head(pos);
+                          }
+                          Message::SetStart((track, pos)) => {
+                              tracks[track as usize].set_start(pos);
+                          }
+                          Message::SetEnd((track, pos)) => {
+                              tracks[track as usize].set_start(pos);
+                          }
+                          _ => {
+                              error!("unexpected message.");
+                          }
+                      }
+                  },
+                  Err(err) => {
+                      match err {
+                          std::sync::mpsc::TryRecvError::Empty => {
+                              break;
+                          }
+                          std::sync::mpsc::TryRecvError::Disconnected => {
+                              error!("disconnected");
+                          }
+                      }
+                  }
+                }
+            }
             {
                 let mut m = Mixer::new(output);
 
@@ -242,17 +324,69 @@ fn main() {
                     m.mix(&buf);
                 }
             }
+            clock_updater.increment(output.len());
             output.len() as isize
         })
     .state_callback(|state| {
-        println!("stream {:?}", state);
+        info!("stream {:?}", state);
     });
 
     let stream = builder.init(&ctx).expect("Failed to create cubeb stream");
 
+
+    let mut monome = Monome::new("/mlr-rs").unwrap();
+
     stream.start().unwrap();
+
+    let mut tracks_enabled : Vec<bool> = vec![false; 7];
+    let mut tracks_pos: Vec<usize> = vec![0; 7];
+
+    monome.all(false);
+
+    let tempo = 128;
     loop {
-        thread::sleep(Duration::from_millis(5000));
+        loop {
+            match monome.poll() {
+                Some(MonomeEvent::GridKey{x, y, direction}) => {
+                    match direction {
+                        KeyDirection::Down => {
+                            info!("Key down : {}x{}", x, y);
+                        }
+                        KeyDirection::Up => {
+                            // control row
+                            if y == 0 {
+                                let x = x as usize;
+                                match x {
+                                    0...7 => {
+                                        if tracks_enabled[x] {
+                                            tracks_enabled[x] = false;
+                                            monome.set(x as i32, 0, false);
+                                            sender.send(Message::Disable(x as i32));
+                                        } else {
+                                            tracks_enabled[x] = true;
+                                            monome.set(x as i32, 0, true);
+                                            sender.send(Message::Enable(x as i32));
+                                        }
+                                    },
+                                    _ => {
+                                        // not implemented
+                                    }
+                                }
+                            }
+                        }
+
+                    }
+                }
+                Some(_) => {
+                    break;
+                }
+                None => {
+                    break;
+                }
+            }
+        }
+        println!("{}", clock_receiver.beat());
+       thread::sleep(Duration::from_millis(10));
     }
 
 }
