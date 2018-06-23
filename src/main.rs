@@ -76,7 +76,7 @@ enum PlaybackDirection {
 
 struct MLRTrack
 {
-    row_index: u32,
+    row_index: usize,
     playing: bool,
     current_pos: usize,
     sample: MLRSample,
@@ -85,9 +85,74 @@ struct MLRTrack
     direction: PlaybackDirection
 }
 
+struct MLRTrackMetadata
+{
+    row_index: usize,
+    playing: bool,
+    current_pos: usize,
+    start_index: usize, // [0, 15]
+    stop_index: usize, // [0, 15], strictly greater than start
+    direction: PlaybackDirection,
+    frames: usize
+}
+
+impl MLRTrackMetadata
+{
+    fn update_pos(&mut self, diff: usize) {
+        if !self.playing {
+            return;
+        }
+        let min = self.index_to_frames(self.start_index);
+        let max = self.index_to_frames(self.stop_index);
+        self.current_pos += diff;
+        if self.current_pos > max {
+            self.current_pos = min + (self.current_pos - max);
+        }
+    }
+    fn enabled(&self) -> bool {
+        self.playing
+    }
+    fn start(&mut self) {
+        self.playing = true;
+    }
+    fn stop(&mut self) {
+        self.playing = false;
+    }
+    fn set_start(&mut self, index: usize) {
+        self.start_index = index;
+    }
+    fn set_stop(&mut self, index: usize) {
+        self.stop_index = index;
+    }
+    fn set_head(&mut self, index: usize) {
+        println!("set_head: {}", index);
+        self.current_pos = self.index_to_frames(index);
+        println!("current_pos: {}", self.current_pos);
+    }
+    fn set_direction(&mut self,direction: PlaybackDirection) {
+        self.direction = direction;
+    }
+    fn frames_to_index(&self, frames: usize) -> usize {
+      //  println!("{} * 16 / {} = {}", frames, self.frames, frames * 16 / self.frames);
+        frames * 16 / self.frames
+    }
+    fn index_to_frames(&self, index: usize) -> usize{
+        // println!("{} / 16 * {} = {}", self.frames, index, (self.frames / 16) * index);
+        (self.frames / 16) * index
+    }
+    fn current_led(&self) -> usize {
+        let c = self.frames_to_index(self.current_pos);
+       // println!("current: {}", c);
+        c
+    }
+    fn row_index(&self) -> usize {
+        self.row_index
+    }
+}
+
 impl MLRTrack
 {
-    fn new(row_index: u32, sample: MLRSample) -> MLRTrack {
+    fn new(row_index: usize, sample: MLRSample) -> MLRTrack {
         MLRTrack {
             row_index,
             playing: false,
@@ -95,6 +160,17 @@ impl MLRTrack
             sample,
             start_index: 0,
             stop_index: 16,
+            direction: PlaybackDirection::FORWARD
+        }
+    }
+    fn metadata(&self) -> MLRTrackMetadata {
+        MLRTrackMetadata {
+            row_index: self.row_index,
+            playing: false,
+            current_pos: 0,
+            start_index: 0,
+            stop_index: 16,
+            frames: self.sample.frames(),
             direction: PlaybackDirection::FORWARD
         }
     }
@@ -140,6 +216,9 @@ impl MLRTrack
         remaining_frames -= 1;
         buf_offset+=1;
       }
+    }
+    fn name(&self) -> &str {
+        self.sample.name()
     }
 }
 
@@ -252,10 +331,13 @@ fn main() {
     let common_rate = samples[0].rate();
 
     let mut tracks: Vec<MLRTrack> = Vec::new();
+    let mut tracks_meta: Vec<MLRTrackMetadata> = Vec::new();
     let mut row = 0;
     for _i in 0..samples.len() {
       let s = samples.remove(0);
-      tracks.push(MLRTrack::new(row, s));
+      let t = MLRTrack::new(row, s);
+      tracks_meta.push(t.metadata());
+      tracks.push(t);
       row += 1;
     }
 
@@ -286,18 +368,21 @@ fn main() {
                       match msg {
                           Message::Enable(track) => {
                               tracks[track as usize].start();
+                              info!("starting {}", tracks[track as usize].name());
                           }
                           Message::Disable(track) => {
                               tracks[track as usize].stop();
+                              info!("stopping {}", tracks[track as usize].name());
                           }
                           Message::SetHead((track, pos)) => {
                               tracks[track as usize].set_head(pos);
+                              info!("setting head for {} at {}", tracks[track as usize].name(), pos);
                           }
                           Message::SetStart((track, pos)) => {
                               tracks[track as usize].set_start(pos);
                           }
                           Message::SetEnd((track, pos)) => {
-                              tracks[track as usize].set_start(pos);
+                              tracks[track as usize].set_stop(pos);
                           }
                           _ => {
                               error!("unexpected message.");
@@ -343,14 +428,29 @@ fn main() {
 
     monome.all(false);
 
-    let tempo = 128;
+    let mut prev_clock = 0;
+
+    let mut leds: Vec<i32> = vec![-1; 7];
+
     loop {
         loop {
             match monome.poll() {
                 Some(MonomeEvent::GridKey{x, y, direction}) => {
                     match direction {
                         KeyDirection::Down => {
-                            info!("Key down : {}x{}", x, y);
+                            match y {
+                                1...8 => {
+                                    let track_index = y - 1; // offset the control row
+                                    tracks_meta[track_index as usize].start();
+                                    tracks_meta[track_index as usize].set_head(x as usize);
+                                    monome.set(y - 1 as i32, 0, true);
+                                    sender.send(Message::Enable(y as i32 - 1)).unwrap();
+                                    sender.send(Message::SetHead((y as u32 - 1, x as u32)));
+                                }
+                                _ => {
+                                    // nothing to do on key up for control row
+                                }
+                            }
                         }
                         KeyDirection::Up => {
                             // control row
@@ -358,14 +458,14 @@ fn main() {
                                 let x = x as usize;
                                 match x {
                                     0...7 => {
-                                        if tracks_enabled[x] {
-                                            tracks_enabled[x] = false;
+                                        if tracks_meta[x].enabled() {
+                                            tracks_meta[x].stop();
                                             monome.set(x as i32, 0, false);
-                                            sender.send(Message::Disable(x as i32));
+                                            sender.send(Message::Disable(x as i32)).unwrap();
                                         } else {
-                                            tracks_enabled[x] = true;
+                                            tracks_meta[x].start();
                                             monome.set(x as i32, 0, true);
-                                            sender.send(Message::Enable(x as i32));
+                                            sender.send(Message::Enable(x as i32)).unwrap();
                                         }
                                     },
                                     _ => {
@@ -385,8 +485,22 @@ fn main() {
                 }
             }
         }
-        println!("{}", clock_receiver.beat());
-       thread::sleep(Duration::from_millis(10));
+        /// println!("{}", clock_receiver.beat());
+        let current_time = clock_receiver.raw_frames();
+        let diff = current_time - prev_clock;
+        for t in tracks_meta.iter_mut() {
+            t.update_pos(diff);
+            if t.enabled() {
+                let current_led = t.current_led();
+                if leds[t.row_index()] != current_led as i32 && t.enabled() {
+                    monome.set(leds[t.row_index()] as i32, t.row_index() as i32 + 1, false);
+                    leds[t.row_index()] = current_led as i32;
+                    monome.set(t.current_led() as i32, t.row_index() as i32 + 1, true);
+                }
+            }
+        }
+        prev_clock = current_time;
+        thread::sleep(Duration::from_millis(10));
     }
 
 }
