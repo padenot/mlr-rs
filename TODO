@@ -1,0 +1,3 @@
+- stereo (fix cubeb-rs confusion between frames and samples)
+- actually use monome-rs
+- reverse playback
