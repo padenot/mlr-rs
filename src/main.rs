@@ -10,7 +10,7 @@ use std::fs::DirEntry;
 use std::env;
 use std::cmp;
 use std::thread;
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{channel, Sender};
 use std::time::Duration;
 use std::ops::Index;
 use std::sync::{Arc, Mutex};
@@ -69,7 +69,7 @@ impl Index<usize> for MLRSample {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 enum PlaybackDirection {
     FORWARD,
     BACKWARD
@@ -151,6 +151,12 @@ impl MLRTrackMetadata
     }
     fn name(&self) -> &str {
         &self.name
+    }
+    fn begin(&self) -> isize {
+        self.start_index
+    }
+    fn end(&self) -> isize {
+        self.stop_index
     }
 }
 
@@ -393,7 +399,7 @@ impl GridStateTracker {
             MLRAction::TrackStatus(x)
         } else { // tracks rows
             match self.buttons[Self::idx(self.width, x, y)].clone() {
-                MLRIntent::Nothing => { panic!("what."); }
+                MLRIntent::Nothing => { /* someone pressed a key during startup */ }
                 MLRIntent::Trigger => {
                     self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Nothing;
                     MLRAction::Trigger((x ,y))
@@ -436,6 +442,7 @@ impl GridStateTracker {
     }
 }
 
+
 #[derive(Debug)]
 enum Message {
     Enable((usize)),
@@ -445,6 +452,101 @@ enum Message {
     SetEnd((usize, u32)),
     SetDirection((usize, PlaybackDirection)),
     GainChange((usize, i32))
+}
+
+// This allows keeping the state of the grid on the main thread and sending off the commands to the
+// audio callback.
+struct MLR {
+    sender: Sender<Message>,
+    tracks_meta: Vec<MLRTrackMetadata>,
+    clock_receiver: ClockConsumer,
+    previous_time: usize,
+    leds: Vec<i32>,
+    monome: Monome
+}
+
+impl MLR {
+    fn new(sender: Sender<Message>, tracks_meta: Vec<MLRTrackMetadata>, clock_receiver: ClockConsumer) -> MLR {
+        let leds = vec![-1; 7];
+
+        let mut monome = Monome::new("/mlr-rs").unwrap();
+        monome.all(false);
+        MLR {
+            sender,
+            tracks_meta,
+            clock_receiver,
+            previous_time: 0,
+            leds,
+            monome
+        }
+    }
+    fn track_length(&self) -> u32 {
+      self.monome.width() as u32
+    }
+    fn track_max(&self) -> u32 {
+      self.monome.height() as u32
+    }
+    fn start(&mut self, track_index: usize) {
+        if !self.tracks_meta[track_index].enabled() {
+            self.sender.send(Message::Enable(track_index)).unwrap();
+            self.tracks_meta[track_index as usize].start();
+            self.monome.set(track_index as i32, 0, true);
+        }
+    }
+    fn stop(&mut self, track_index: usize) {
+        if self.tracks_meta[track_index].enabled() {
+            self.sender.send(Message::Disable(track_index)).unwrap();
+            self.tracks_meta[track_index as usize].stop();
+            self.monome.set(track_index as i32, 0, false);
+        }
+    }
+    fn set_head(&mut self, track_index: usize, head_pos: isize) {
+        self.sender.send(Message::SetHead((track_index, head_pos as u32))).unwrap();
+        self.tracks_meta[track_index as usize].set_head(head_pos as isize);
+        self.monome.set(track_index as i32, 0, true);
+    }
+    fn set_start(&mut self, track_index: usize, start: usize) {
+        self.sender.send(Message::SetStart((track_index, start as u32))).unwrap();
+        self.tracks_meta[track_index].set_start(start as isize);
+    }
+    fn set_end(&mut self, track_index: usize, end: usize) {
+        self.sender.send(Message::SetEnd((track_index, end as u32))).unwrap();
+        self.tracks_meta[track_index].set_stop(end as isize);
+    }
+    fn set_direction(&mut self, track_index: usize, direction: PlaybackDirection) {
+        self.sender.send(Message::SetDirection((track_index, direction.clone()))).unwrap();
+        self.tracks_meta[track_index].set_direction(direction);
+    }
+    fn change_gain(&mut self, track_index: usize, gain_delta: i32) {
+        self.sender.send(Message::GainChange((track_index, gain_delta))).unwrap();
+    }
+    fn enabled(&mut self, track_index: usize) -> bool {
+        self.tracks_meta[track_index].enabled()
+    }
+    fn track_loaded(&mut self, track_index: usize) -> bool {
+        track_index < self.tracks_meta.len()
+    }
+    fn update_leds(&mut self) {
+        let current_time = self.clock_receiver.raw_frames();
+        let diff = (current_time - self.previous_time)  as isize;
+        for t in self.tracks_meta.iter_mut() {
+            t.update_pos(diff);
+            if t.enabled() {
+                let current_led = t.current_led();
+                if self.leds[t.row_index()] != current_led as i32 && t.enabled() {
+                    self.monome.set(self.leds[t.row_index()] as i32, t.row_index() as i32 + 1, false);
+                    self.leds[t.row_index()] = current_led as i32;
+                    self.monome.set(t.current_led() as i32, t.row_index() as i32 + 1, true);
+                }
+            }
+        }
+        self.previous_time = current_time;
+
+    }
+
+    fn poll(&mut self) -> Option<MonomeEvent> {
+        self.monome.poll()
+    }
 }
 
 fn main() {
@@ -564,9 +666,6 @@ fn main() {
                               info!("adjust gain for {}, delta {}", tracks[track as usize].name(), gain_delta);
                               tracks[track as usize].adjust_gain(gain_delta);
                           }
-                          _ => {
-                              error!("unexpected message.");
-                          }
                       }
                   },
                   Err(err) => {
@@ -598,23 +697,15 @@ fn main() {
 
     let stream = builder.init(&ctx).expect("Failed to create cubeb stream");
 
-    let mut monome = Monome::new("/mlr-rs").unwrap();
 
     stream.start().unwrap();
 
-    let mut tracks_enabled : Vec<bool> = vec![false; 7];
-    let mut tracks_pos: Vec<usize> = vec![0; 7];
-
-    monome.all(false);
-
-    let mut prev_clock = 0;
-
-    let mut leds: Vec<i32> = vec![-1; 7];
-    let mut state_tracker = GridStateTracker::new(monome.width(), monome.height());
+    let mut mlr = MLR::new(sender, tracks_meta, clock_receiver);
+    let mut state_tracker = GridStateTracker::new(mlr.track_length() as usize, mlr.track_max() as usize + 1);
 
     loop {
         loop {
-            match monome.poll() {
+            match mlr.poll() {
                 Some(MonomeEvent::GridKey{x, y, direction}) => {
                     match direction {
                         KeyDirection::Down => {
@@ -624,68 +715,51 @@ fn main() {
                             match state_tracker.up(x as usize, y as usize) {
                                 MLRAction::Trigger((x, y)) => {
                                     let track_index = y - 1;
-                                    println!("{} > {} ", track_index, tracks_meta.len());
-                                    if track_index > tracks_meta.len() - 1 {
-                                        break;
+                                    if !mlr.track_loaded(track_index) {
+                                        continue;
                                     }
-                                    tracks_meta[track_index as usize].start();
-                                    tracks_meta[track_index as usize].set_head(x as isize);
-                                    monome.set((y - 1) as i32, 0, true);
-                                    sender.send(Message::Enable((y - 1))).unwrap();
-                                    sender.send(Message::SetHead((y - 1, x as u32))).unwrap();
-                                    sender.send(Message::SetStart(((y - 1) as usize, 0))).unwrap();
-                                    sender.send(Message::SetEnd(((y - 1) as usize, 16))).unwrap();
-                                    sender.send(Message::SetDirection(((y - 1) as usize, PlaybackDirection::FORWARD))).unwrap();
-                                    tracks_meta[track_index as usize].set_start(0 as isize);
-                                    tracks_meta[track_index as usize].set_stop(16 as isize);
-                                    tracks_meta[track_index as usize].set_direction(PlaybackDirection::FORWARD);
+                                    mlr.start(track_index);
+                                    mlr.set_head(track_index, x as isize);
+                                    mlr.set_start(track_index, 0);
+                                    mlr.set_end(track_index, 16);
+                                    mlr.set_direction(track_index, PlaybackDirection::FORWARD);
                                 }
                                 MLRAction::Loop((row, mut start, mut end)) => {
                                     let track_index = row - 1;
-                                    if track_index > tracks_meta.len() - 1 {
-                                        break;
+                                    if !mlr.track_loaded(track_index) {
+                                        continue;
                                     }
                                     if start > end {
-                                        sender.send(Message::SetDirection(((y - 1) as usize, PlaybackDirection::BACKWARD))).unwrap();
-                                        sender.send(Message::SetHead(((y - 1) as usize, end as u32))).unwrap();
-                                        tracks_meta[track_index as usize].set_direction(PlaybackDirection::BACKWARD);
-                                        tracks_meta[track_index as usize].set_head(end as isize);
+                                        mlr.set_direction(track_index, PlaybackDirection::BACKWARD);
+                                        mlr.set_head(track_index, end as isize);
                                     } else {
-                                        sender.send(Message::SetDirection(((y - 1) as usize, PlaybackDirection::FORWARD))).unwrap();
-                                        sender.send(Message::SetHead(((y - 1) as usize, start as u32))).unwrap();
-                                        tracks_meta[track_index as usize].set_head(start as isize);
-                                        tracks_meta[track_index as usize].set_direction(PlaybackDirection::FORWARD);
+                                        mlr.set_direction(track_index, PlaybackDirection::FORWARD);
+                                        mlr.set_head(track_index, start as isize);
                                     }
                                     if start > end {
                                         std::mem::swap(&mut start, &mut end);
                                     }
-                                    sender.send(Message::SetStart(((y - 1) as usize, start as u32))).unwrap();
-                                    sender.send(Message::SetEnd(((y - 1) as usize, end as u32))).unwrap();
-                                    tracks_meta[track_index as usize].set_start(start as isize);
-                                    tracks_meta[track_index as usize].set_stop(end as isize);
-                                    if !tracks_meta[track_index as usize].enabled() {
-                                        tracks_meta[track_index as usize].start();
-                                        sender.send(Message::Enable(track_index as usize)).unwrap();
-                                    }
+                                    mlr.set_start(track_index, start);
+                                    mlr.set_end(track_index, end);
+                                    mlr.start(track_index);
                                 }
-                                MLRAction::GainChange((track, gain_delta)) => {
-                                    sender.send(Message::GainChange((track, gain_delta)));
-                                }
-                                MLRAction::TrackStatus(track) => {
-                                    if track as usize > tracks_meta.len() {
+                                MLRAction::GainChange((track_index, gain_delta)) => {
+                                    if !mlr.track_loaded(track_index) {
                                         continue;
                                     }
-                                    if tracks_meta[x as usize].enabled() {
-                                        tracks_meta[x as usize].stop();
-                                        monome.set(x as i32, 0, false);
-                                        sender.send(Message::Disable(x as usize)).unwrap();
+                                    mlr.change_gain(track_index, gain_delta);
+                                }
+                                MLRAction::TrackStatus(track_index) => {
+                                    if !mlr.track_loaded(track_index) {
+                                        continue;
+                                    }
+                                    if mlr.enabled(x as usize) {
+                                        mlr.stop(x as usize);
                                     } else {
-                                        tracks_meta[x as usize].start();
-                                        monome.set(x as i32, 0, true);
-                                        sender.send(Message::Enable(x as usize)).unwrap();
+                                        mlr.start(x as usize);
                                     }
                                 }
-                                MLRAction::Pattern(pattern) => {
+                                MLRAction::Pattern(_pattern) => {
                                     info!("not implemented");
                                 }
                                 MLRAction::Nothing => {
@@ -702,21 +776,9 @@ fn main() {
                 }
             }
         }
-        let current_time = clock_receiver.raw_frames();
-        let diff = (current_time - prev_clock)  as isize;
-        for t in tracks_meta.iter_mut() {
-            t.update_pos(diff);
-            if t.enabled() {
-                let current_led = t.current_led();
-                if leds[t.row_index()] != current_led as i32 && t.enabled() {
-                    monome.set(leds[t.row_index()] as i32, t.row_index() as i32 + 1, false);
-                    leds[t.row_index()] = current_led as i32;
-                    monome.set(t.current_led() as i32, t.row_index() as i32 + 1, true);
-                }
-            }
-        }
-        prev_clock = current_time;
-        thread::sleep(Duration::from_millis(10));
+
+        thread::sleep(Duration::from_millis(1));
+        mlr.update_leds();
     }
 
 }
