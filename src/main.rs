@@ -4,6 +4,8 @@ extern crate pretty_env_logger;
 extern crate log;
 extern crate cubeb;
 extern crate monome;
+extern crate timer;
+extern crate chrono;
 
 use std::fs;
 use std::fs::DirEntry;
@@ -12,6 +14,7 @@ use std::cmp;
 use std::thread;
 use std::sync::mpsc::{channel, Sender};
 use std::time::Duration;
+use std::time::Instant;
 use std::ops::Index;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -291,6 +294,9 @@ impl ClockConsumer {
     fn beat(&self) -> f32 {
         self.tempo / 60. * (self.raw_frames() as f32 / self.rate as f32)
     }
+    fn beat_duration(&self) -> f32 {
+        self.tempo / 60.
+    }
 }
 
 fn clock(tempo: f32, rate: u32) -> (ClockUpdater, ClockConsumer) {
@@ -330,7 +336,7 @@ enum MLRIntent
     Trigger,
     Loop
 }
-
+#[derive(Debug)]
 enum MLRAction
 {
     Nothing,
@@ -338,7 +344,7 @@ enum MLRAction
     Loop((usize, usize, usize)),
     GainChange((usize, i32)),
     TrackStatus(usize),
-    Pattern(usize)
+    Pattern(u8)
 }
 
 struct GridStateTracker {
@@ -380,27 +386,22 @@ impl GridStateTracker {
         if y == 0 { // control row
             // is mod 1 (8th button) or mod 2 (9th button) down
             let mut gain_delta = 0;
-            let mut pattern = 0;
             if self.buttons[Self::idx(self.width, 7, y)] != MLRIntent::Nothing {
                 gain_delta = -1;
             }
             if self.buttons[Self::idx(self.width, 8, y)] != MLRIntent::Nothing {
                 gain_delta = 1;
             }
-            if self.buttons[Self::idx(self.width, 9, y)] != MLRIntent::Nothing {
-                pattern = 1;
-            }
-            if self.buttons[Self::idx(self.width, 10, y)] != MLRIntent::Nothing {
-                pattern = 2;
-            }
-            self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Nothing;
             if gain_delta != 0 {
                 return MLRAction::GainChange((x, gain_delta))
             }
-            if pattern != 0 {
-                return MLRAction::Pattern(pattern)
+            if self.buttons[Self::idx(self.width, 14, y)] != MLRIntent::Nothing {
+                return MLRAction::Pattern(0)
             }
-
+            if self.buttons[Self::idx(self.width, 15, y)] != MLRIntent::Nothing {
+                return MLRAction::Pattern(1)
+            }
+            self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Nothing;
             MLRAction::TrackStatus(x)
         } else { // tracks rows
             match self.buttons[Self::idx(self.width, x, y)].clone() {
@@ -533,6 +534,12 @@ impl MLR {
     }
     fn track_loaded(&mut self, track_index: usize) -> bool {
         track_index < self.tracks_meta.len()
+    }
+    fn start_recording(&mut self, pattern_index: usize) {
+        self.monome.set(14 + pattern_index as i32, 0, true);
+    }
+    fn end_recording(&mut self, pattern_index: usize) {
+        self.monome.set(14 + pattern_index as i32, 0, 8);
     }
     fn update_leds(&mut self) {
         let current_time = self.clock_receiver.raw_frames();
@@ -710,7 +717,14 @@ fn main() {
     stream.start().unwrap();
 
     let mut mlr = MLR::new(sender, tracks_meta, clock_receiver);
+    let mut pattern = Vec::<(Instant, MLRAction)>::new();
+    let mut recording_end: Option<Instant> = None;
+    let recording_duration_ms: f32 = 60. / 128. * 1000. * 16.;
+    println!("rec dur. {}", recording_duration_ms);
+    let recording_duration = Duration::from_millis(recording_duration_ms as u64);
+    let mut recording: bool = false;
     let mut state_tracker = GridStateTracker::new(mlr.track_length() as usize, mlr.track_max() as usize + 1);
+    let index = 0;
 
     loop {
         loop {
@@ -723,6 +737,16 @@ fn main() {
                         KeyDirection::Up => {
                             match state_tracker.up(x as usize, y as usize) {
                                 MLRAction::Trigger((x, y)) => {
+                                    if recording {
+                                        if pattern.len() == 0 {
+                                            println!("trigger");
+                                            recording_end = Some(Instant::now() + recording_duration);
+                                            pattern.clear();
+                                        }
+                                        println!("{:?}", pattern);
+                                        pattern.push((Instant::now(), MLRAction::Trigger((x, y))));
+                                    }
+
                                     let track_index = y - 1;
                                     if !mlr.track_loaded(track_index) {
                                         continue;
@@ -734,6 +758,15 @@ fn main() {
                                     mlr.set_direction(track_index, PlaybackDirection::FORWARD);
                                 }
                                 MLRAction::Loop((row, mut start, mut end)) => {
+                                    if recording {
+                                        if pattern.len() == 0 {
+                                            println!("trigger");
+                                            recording_end = Some(Instant::now() + recording_duration);
+                                            pattern.clear();
+                                        }
+                                        println!("{:?}", pattern);
+                                        pattern.push((Instant::now(), MLRAction::Loop((row, start, end))));
+                                    }
                                     let track_index = row - 1;
                                     if !mlr.track_loaded(track_index) {
                                         continue;
@@ -768,8 +801,9 @@ fn main() {
                                         mlr.start(x as usize);
                                     }
                                 }
-                                MLRAction::Pattern(_pattern) => {
-                                    info!("not implemented");
+                                MLRAction::Pattern(pattern) => {
+                                    println!("pattern");
+                                    recording = true;
                                 }
                                 MLRAction::Nothing => {
                                 }
@@ -788,6 +822,17 @@ fn main() {
 
         thread::sleep(Duration::from_millis(1));
         mlr.update_leds();
-    }
 
+        match recording_end {
+            Some(end) => {
+                if end < Instant::now() {
+                    println!("########### END {:?}", pattern);
+                    recording = false;
+                    recording_end = None;
+                }
+            }
+            _  => {
+            }
+        }
+    }
 }
