@@ -14,7 +14,6 @@ use std::cmp;
 use std::thread;
 use std::sync::mpsc::{channel, Sender};
 use std::time::Duration;
-use std::time::Instant;
 use std::ops::Index;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -299,6 +298,16 @@ impl ClockConsumer {
     }
 }
 
+impl Clone for ClockConsumer {
+    fn clone(&self) -> ClockConsumer {
+        ClockConsumer {
+            rate: self.rate,
+            tempo: self.tempo,
+            clock: self.clock.clone()
+        }
+    }
+}
+
 fn clock(tempo: f32, rate: u32) -> (ClockUpdater, ClockConsumer) {
     let c = Arc::new(AtomicUsize::new(0));
     (ClockUpdater { clock: c.clone() }, ClockConsumer { clock: c, tempo, rate })
@@ -336,7 +345,7 @@ enum MLRIntent
     Trigger,
     Loop
 }
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 enum MLRAction
 {
     Nothing,
@@ -564,6 +573,176 @@ impl MLR {
     }
 }
 
+// TODO change this name it's ridiculous. This should be MLR and the current MLR should be name
+// something about tracks or something.
+struct MLRMLR {
+    mlr: MLR,
+    audio_clock: ClockConsumer,
+    pattern: Vec<(usize, MLRAction)>,
+    recording_end: Option<usize>,
+    recording_duration_frames: usize,
+    recording: bool,
+    recording_playback: bool,
+    pattern_index: usize,
+    pattern_rec_time_end: usize,
+    state_tracker: GridStateTracker
+}
+
+impl MLRMLR {
+    fn new(mlr: MLR, state_tracker: GridStateTracker, audio_clock: ClockConsumer) -> MLRMLR {
+        MLRMLR {
+            mlr,
+            audio_clock,
+            pattern:  Vec::new(),
+            recording_end: None,
+            recording_duration_frames: (60. / 128. * 4. * 48000.) as usize,
+            recording: false,
+            recording_playback: false,
+            pattern_index: 0,
+            pattern_rec_time_end: 0,
+            state_tracker
+        }
+    }
+    fn handle_action(&mut self, action: MLRAction) {
+        if self.recording {
+            if self.pattern.len() == 0 {
+                let begin = self.audio_clock.raw_frames();
+                self.recording_end = Some(begin + self.recording_duration_frames);
+                println!("trigger: begin: {} / end: {} / duration: {}", begin, self.recording_end.unwrap(), self.recording_duration_frames);
+                self.pattern.clear();
+            }
+            println!("{:?}", self.pattern);
+            self.pattern.push((self.audio_clock.raw_frames(), action));
+        }
+
+        match action {
+            MLRAction::Trigger((x, y)) => {
+                let track_index = y - 1;
+                if !self.mlr.track_loaded(track_index) {
+                    return;
+                }
+                self.mlr.start(track_index);
+                self.mlr.set_head(track_index, x as isize);
+                self.mlr.set_start(track_index, 0);
+                self.mlr.set_end(track_index, 16);
+                self.mlr.set_direction(track_index, PlaybackDirection::FORWARD);
+            }
+            MLRAction::Loop((row, mut start, mut end)) => {
+                let track_index = row - 1;
+                if !self.mlr.track_loaded(track_index) {
+                    return;
+                }
+                if start > end {
+                    self.mlr.set_direction(track_index, PlaybackDirection::BACKWARD);
+                    self.mlr.set_head(track_index, end as isize);
+                } else {
+                    self.mlr.set_direction(track_index, PlaybackDirection::FORWARD);
+                    self.mlr.set_head(track_index, start as isize);
+                }
+                if start > end {
+                    std::mem::swap(&mut start, &mut end);
+                }
+                self.mlr.set_start(track_index, start);
+                self.mlr.set_end(track_index, end);
+                self.mlr.start(track_index);
+            }
+            MLRAction::GainChange((track_index, gain_delta)) => {
+                if !self.mlr.track_loaded(track_index) {
+                    return;
+                }
+                self.mlr.change_gain(track_index, gain_delta);
+            }
+            MLRAction::TrackStatus(track_index) => {
+                if !self.mlr.track_loaded(track_index) {
+                    return;
+                }
+                if self.mlr.enabled(track_index as usize) {
+                    self.mlr.stop(track_index as usize);
+                } else {
+                    self.mlr.start(track_index as usize);
+                }
+            }
+            MLRAction::Pattern(pattern) => {
+                self.recording = true;
+            }
+            MLRAction::Nothing => {
+            }
+        }
+    }
+    fn main_loop(&mut self) {
+        loop {
+            loop {
+                if self.recording_playback {
+                    debug!("pattern[{}].begin: {:?}, offset: {}, end: {}",
+                           self.pattern_index,
+                           self.pattern[self.pattern_index].0,
+                           self.audio_clock.raw_frames() - self.pattern_rec_time_end,
+                           self.recording_duration_frames);
+                    // this is the clock time, between 0 and the duration of a row, 0 being the
+                    // start time of a loop of a pattern.
+                    let clock_in_pattern = (self.audio_clock.raw_frames() - self.pattern_rec_time_end) % self.recording_duration_frames;
+                    // if the current time is later than the current action time in the pattern,
+                    // and we're not playing after the last pattern item (waiting to loop, pattern
+                    // index being zero and clock time being past the last item start time),
+                    // trigger the action and move to the next pattern item. If we're past the end,
+                    // wrap around in the pattern array.
+                    if clock_in_pattern > self.pattern[self.pattern_index].0 &&
+                        !(self.pattern_index == 0 && clock_in_pattern > self.pattern.last().unwrap().0) {
+                            let action = self.pattern[self.pattern_index].1.clone();
+                            self.pattern_index += 1;
+                            if self.pattern_index == self.pattern.len() {
+                                self.pattern_index = 0;
+                            }
+                            self.handle_action(action);
+                        }
+                }
+
+                match self.mlr.poll() {
+                    Some(MonomeEvent::GridKey{x, y, direction}) => {
+                        match direction {
+                            KeyDirection::Down => {
+                                self.state_tracker.down(x as usize, y as usize);
+                            },
+                            KeyDirection::Up => {
+                                let action = self.state_tracker.up(x as usize, y as usize);
+                                self.handle_action(action);
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        break;
+                    }
+                    None => {
+                        break;
+                    }
+                }
+            }
+
+            thread::sleep(Duration::from_millis(1));
+            self.mlr.update_leds();
+
+            match self.recording_end {
+                Some(end) => {
+                    if end < self.audio_clock.raw_frames() {
+                        self.pattern_rec_time_end = self.audio_clock.raw_frames();
+                        self.recording = false;
+                        self.recording_end = None;
+                        self.recording_playback = true;
+                        let offset = self.pattern[0].0;
+                        // normalize pattern with a 0 start
+                        for i in 0..self.pattern.len() {
+                            self.pattern[i].0 -= offset;
+                        }
+                        println!("########### END {:?}", self.pattern);
+                    }
+                }
+                _  => {
+                }
+            }
+        }
+    }
+}
+
 fn main() {
     pretty_env_logger::init();
 
@@ -716,123 +895,11 @@ fn main() {
 
     stream.start().unwrap();
 
+    let clock2 = clock_receiver.clone();
     let mut mlr = MLR::new(sender, tracks_meta, clock_receiver);
-    let mut pattern = Vec::<(Instant, MLRAction)>::new();
-    let mut recording_end: Option<Instant> = None;
-    let recording_duration_ms: f32 = 60. / 128. * 1000. * 16.;
-    println!("rec dur. {}", recording_duration_ms);
-    let recording_duration = Duration::from_millis(recording_duration_ms as u64);
-    let mut recording: bool = false;
-    let mut state_tracker = GridStateTracker::new(mlr.track_length() as usize, mlr.track_max() as usize + 1);
-    let index = 0;
+    let state_tracker = GridStateTracker::new(16, 8);
 
-    loop {
-        loop {
-            match mlr.poll() {
-                Some(MonomeEvent::GridKey{x, y, direction}) => {
-                    match direction {
-                        KeyDirection::Down => {
-                            state_tracker.down(x as usize, y as usize);
-                        },
-                        KeyDirection::Up => {
-                            match state_tracker.up(x as usize, y as usize) {
-                                MLRAction::Trigger((x, y)) => {
-                                    if recording {
-                                        if pattern.len() == 0 {
-                                            println!("trigger");
-                                            recording_end = Some(Instant::now() + recording_duration);
-                                            pattern.clear();
-                                        }
-                                        println!("{:?}", pattern);
-                                        pattern.push((Instant::now(), MLRAction::Trigger((x, y))));
-                                    }
+    let mut mlrmlr = MLRMLR::new(mlr, state_tracker, clock2);
 
-                                    let track_index = y - 1;
-                                    if !mlr.track_loaded(track_index) {
-                                        continue;
-                                    }
-                                    mlr.start(track_index);
-                                    mlr.set_head(track_index, x as isize);
-                                    mlr.set_start(track_index, 0);
-                                    mlr.set_end(track_index, 16);
-                                    mlr.set_direction(track_index, PlaybackDirection::FORWARD);
-                                }
-                                MLRAction::Loop((row, mut start, mut end)) => {
-                                    if recording {
-                                        if pattern.len() == 0 {
-                                            println!("trigger");
-                                            recording_end = Some(Instant::now() + recording_duration);
-                                            pattern.clear();
-                                        }
-                                        println!("{:?}", pattern);
-                                        pattern.push((Instant::now(), MLRAction::Loop((row, start, end))));
-                                    }
-                                    let track_index = row - 1;
-                                    if !mlr.track_loaded(track_index) {
-                                        continue;
-                                    }
-                                    if start > end {
-                                        mlr.set_direction(track_index, PlaybackDirection::BACKWARD);
-                                        mlr.set_head(track_index, end as isize);
-                                    } else {
-                                        mlr.set_direction(track_index, PlaybackDirection::FORWARD);
-                                        mlr.set_head(track_index, start as isize);
-                                    }
-                                    if start > end {
-                                        std::mem::swap(&mut start, &mut end);
-                                    }
-                                    mlr.set_start(track_index, start);
-                                    mlr.set_end(track_index, end);
-                                    mlr.start(track_index);
-                                }
-                                MLRAction::GainChange((track_index, gain_delta)) => {
-                                    if !mlr.track_loaded(track_index) {
-                                        continue;
-                                    }
-                                    mlr.change_gain(track_index, gain_delta);
-                                }
-                                MLRAction::TrackStatus(track_index) => {
-                                    if !mlr.track_loaded(track_index) {
-                                        continue;
-                                    }
-                                    if mlr.enabled(x as usize) {
-                                        mlr.stop(x as usize);
-                                    } else {
-                                        mlr.start(x as usize);
-                                    }
-                                }
-                                MLRAction::Pattern(pattern) => {
-                                    println!("pattern");
-                                    recording = true;
-                                }
-                                MLRAction::Nothing => {
-                                }
-                            }
-                        }
-                    }
-                }
-                Some(_) => {
-                    break;
-                }
-                None => {
-                    break;
-                }
-            }
-        }
-
-        thread::sleep(Duration::from_millis(1));
-        mlr.update_leds();
-
-        match recording_end {
-            Some(end) => {
-                if end < Instant::now() {
-                    println!("########### END {:?}", pattern);
-                    recording = false;
-                    recording_end = None;
-                }
-            }
-            _  => {
-            }
-        }
-    }
+    mlrmlr.main_loop();
 }
