@@ -547,8 +547,43 @@ struct MLR {
 }
 
 impl MLR {
-    fn new(mlr: MLRControl, state_tracker: GridStateTracker, audio_clock: ClockConsumer) -> MLR {
-        MLR {
+    fn new(audio_clock: ClockConsumer) -> (MLR, MLRRenderer) {
+
+        let (sender, receiver) = channel::<Message>();
+        let rx = Arc::new(Mutex::new(receiver));
+
+        let paths = fs::read_dir("mlr-samples").unwrap();
+
+        let mut samples: Vec<MLRSample> = Vec::new();
+
+        for path in paths {
+            let path = path.unwrap();
+            samples.push(MLRSample::new(&path));
+        }
+
+        if !validate_files(&samples) {
+            std::process::exit(1);
+        }
+
+        let common_rate = samples[0].rate();
+
+        let mut tracks: Vec<MLRTrack> = Vec::new();
+        let mut tracks_meta: Vec<MLRTrackMetadata> = Vec::new();
+        let mut row = 0;
+        for _i in 0..samples.len() {
+          let s = samples.remove(0);
+          let t = MLRTrack::new(row, s);
+          tracks_meta.push(t.metadata());
+          tracks.push(t);
+          row += 1;
+        }
+
+        let mut renderer = MLRRenderer::new(tracks, rx);
+
+        let state_tracker = GridStateTracker::new(16, 8);
+
+        let mut mlr = MLRControl::new(sender, tracks_meta, audio_clock.clone());
+        (MLR {
             mlr,
             audio_clock,
             pattern:  Vec::new(),
@@ -559,7 +594,9 @@ impl MLR {
             pattern_index: 0,
             pattern_rec_time_end: 0,
             state_tracker
-        }
+        }, renderer)
+    }
+    fn setup(&mut self) {
     }
     fn handle_action(&mut self, action: MLRAction) {
         if self.recording {
@@ -627,77 +664,80 @@ impl MLR {
             }
         }
     }
-    fn main_loop(&mut self) {
-        loop {
-            loop {
-                if self.recording_playback {
-                    debug!("pattern[{}].begin: {:?}, offset: {}, end: {}",
-                           self.pattern_index,
-                           self.pattern[self.pattern_index].0,
-                           self.audio_clock.raw_frames() - self.pattern_rec_time_end,
-                           self.recording_duration_frames);
-                    // this is the clock time, between 0 and the duration of a row, 0 being the
-                    // start time of a loop of a pattern.
-                    let clock_in_pattern = (self.audio_clock.raw_frames() - self.pattern_rec_time_end) % self.recording_duration_frames;
-                    // if the current time is later than the current action time in the pattern,
-                    // and we're not playing after the last pattern item (waiting to loop, pattern
-                    // index being zero and clock time being past the last item start time),
-                    // trigger the action and move to the next pattern item. If we're past the end,
-                    // wrap around in the pattern array.
-                    if clock_in_pattern > self.pattern[self.pattern_index].0 &&
-                        !(self.pattern_index == 0 && clock_in_pattern > self.pattern.last().unwrap().0) {
-                            let action = self.pattern[self.pattern_index].1.clone();
-                            self.pattern_index += 1;
-                            if self.pattern_index == self.pattern.len() {
-                                self.pattern_index = 0;
-                            }
-                            self.handle_action(action);
-                        }
+    fn main_thread_work(&mut self) {
+        if self.recording_playback {
+            debug!("pattern[{}].begin: {:?}, offset: {}, end: {}",
+                   self.pattern_index,
+                   self.pattern[self.pattern_index].0,
+                   self.audio_clock.raw_frames() - self.pattern_rec_time_end,
+                   self.recording_duration_frames);
+            // this is the clock time, between 0 and the duration of a row, 0 being the
+            // start time of a loop of a pattern.
+            let clock_in_pattern = (self.audio_clock.raw_frames() - self.pattern_rec_time_end) % self.recording_duration_frames;
+            // if the current time is later than the current action time in the pattern,
+            // and we're not playing after the last pattern item (waiting to loop, pattern
+            // index being zero and clock time being past the last item start time),
+            // trigger the action and move to the next pattern item. If we're past the end,
+            // wrap around in the pattern array.
+            if clock_in_pattern > self.pattern[self.pattern_index].0 &&
+                !(self.pattern_index == 0 && clock_in_pattern > self.pattern.last().unwrap().0) {
+                    let action = self.pattern[self.pattern_index].1.clone();
+                    self.pattern_index += 1;
+                    if self.pattern_index == self.pattern.len() {
+                        self.pattern_index = 0;
+                    }
+                    self.handle_action(action);
                 }
+        }
 
-                match self.mlr.poll() {
-                    Some(MonomeEvent::GridKey{x, y, direction}) => {
-                        match direction {
-                            KeyDirection::Down => {
-                                self.state_tracker.down(x as usize, y as usize);
-                            },
-                            KeyDirection::Up => {
-                                let action = self.state_tracker.up(x as usize, y as usize);
-                                self.handle_action(action);
-                            }
-                        }
+        match self.recording_end {
+            Some(end) => {
+                if end < self.audio_clock.raw_frames() {
+                    self.pattern_rec_time_end = self.audio_clock.raw_frames();
+                    self.recording = false;
+                    self.recording_end = None;
+                    self.recording_playback = true;
+                    let offset = self.pattern[0].0;
+                    // normalize pattern with a 0 start
+                    for i in 0..self.pattern.len() {
+                        self.pattern[i].0 -= offset;
                     }
-                    Some(_) => {
-                        break;
-                    }
-                    None => {
-                        break;
-                    }
+                    println!("########### END {:?}", self.pattern);
                 }
             }
+            _  => {
+            }
+        }
+    }
 
-            thread::sleep(Duration::from_millis(1));
-            self.mlr.update_leds();
-
-            match self.recording_end {
-                Some(end) => {
-                    if end < self.audio_clock.raw_frames() {
-                        self.pattern_rec_time_end = self.audio_clock.raw_frames();
-                        self.recording = false;
-                        self.recording_end = None;
-                        self.recording_playback = true;
-                        let offset = self.pattern[0].0;
-                        // normalize pattern with a 0 start
-                        for i in 0..self.pattern.len() {
-                            self.pattern[i].0 -= offset;
+    fn poll_input(&mut self) {
+        loop {
+            match self.mlr.poll() {
+                Some(MonomeEvent::GridKey{x, y, direction}) => {
+                    match direction {
+                        KeyDirection::Down => {
+                            self.state_tracker.down(x as usize, y as usize);
+                        },
+                        KeyDirection::Up => {
+                            let action = self.state_tracker.up(x as usize, y as usize);
+                            self.handle_action(action);
                         }
-                        println!("########### END {:?}", self.pattern);
                     }
                 }
-                _  => {
+                Some(_) => {
+                    break;
+                }
+                None => {
+                    break;
                 }
             }
         }
+    }
+    fn render(&mut self) {
+        self.mlr.update_leds();
+    }
+
+    fn main_loop(&mut self) {
     }
 }
 
@@ -802,55 +842,19 @@ impl MLRRenderer {
 fn main() {
     pretty_env_logger::init();
 
-    // read all files from $1 directory and load samples
-    let args: Vec<String> = env::args().collect();
-    if args.len() != 2 {
-        usage();
-        return;
-    }
 
-    let paths = fs::read_dir(args[1].clone()).unwrap();
-
-    let mut samples: Vec<MLRSample> = Vec::new();
-
-    for path in paths {
-        let path = path.unwrap();
-        samples.push(MLRSample::new(&path));
-    }
-
-    if !validate_files(&samples) {
-        std::process::exit(1);
-    }
-
-    let common_rate = samples[0].rate();
-
-    let mut tracks: Vec<MLRTrack> = Vec::new();
-    let mut tracks_meta: Vec<MLRTrackMetadata> = Vec::new();
-    let mut row = 0;
-    for _i in 0..samples.len() {
-      let s = samples.remove(0);
-      let t = MLRTrack::new(row, s);
-      tracks_meta.push(t.metadata());
-      tracks.push(t);
-      row += 1;
-    }
-
-    let (sender, receiver) = channel::<Message>();
     let (mut clock_updater, clock_receiver) = audio_clock(128., 48000);
-    let rx = Arc::new(Mutex::new(receiver));
 
-    let mut renderer = MLRRenderer::new(tracks, rx);
+    let (mut mlr, mut renderer) = MLR::new(clock_receiver);
 
     // set up audio output
     let ctx = cubeb::init("mlr-rs").expect("Failed to create cubeb context");
     let params = cubeb::StreamParamsBuilder::new()
         .format(cubeb::SampleFormat::Float32NE)
-        .rate(common_rate)
+        .rate(48000)
         .channels(1)
         .layout(cubeb::ChannelLayout::MONO)
         .take();
-
-    let mut buf = vec![0.0 as f32; 256];
 
     let mut builder = cubeb::StreamBuilder::new();
     builder
@@ -868,14 +872,12 @@ fn main() {
 
     let stream = builder.init(&ctx).expect("Failed to create cubeb stream");
 
-
     stream.start().unwrap();
 
-    let clock2 = clock_receiver.clone();
-    let mut mlr = MLRControl::new(sender, tracks_meta, clock_receiver);
-    let state_tracker = GridStateTracker::new(16, 8);
-
-    let mut mlrmlr = MLR::new(mlr, state_tracker, clock2);
-
-    mlrmlr.main_loop();
+    loop {
+        mlr.main_thread_work();
+        mlr.poll_input();
+        mlr.render();
+        thread::sleep(Duration::from_millis(1));
+    }
 }
