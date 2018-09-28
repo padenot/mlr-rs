@@ -434,7 +434,7 @@ enum Message {
 
 // This allows keeping the state of the grid on the main thread and sending off the commands to the
 // audio callback.
-struct MLR {
+struct MLRControl {
     sender: Sender<Message>,
     tracks_meta: Vec<MLRTrackMetadata>,
     clock_receiver: ClockConsumer,
@@ -443,13 +443,13 @@ struct MLR {
     monome: Monome
 }
 
-impl MLR {
-    fn new(sender: Sender<Message>, tracks_meta: Vec<MLRTrackMetadata>, clock_receiver: ClockConsumer) -> MLR {
+impl MLRControl {
+    fn new(sender: Sender<Message>, tracks_meta: Vec<MLRTrackMetadata>, clock_receiver: ClockConsumer) -> MLRControl {
         let leds = vec![-1; 7];
 
         let mut monome = Monome::new("/mlr-rs").unwrap();
         monome.all(false);
-        MLR {
+        MLRControl {
             sender,
             tracks_meta,
             clock_receiver,
@@ -533,10 +533,8 @@ impl MLR {
     }
 }
 
-// TODO change this name it's ridiculous. This should be MLR and the current MLR should be name
-// something about tracks or something.
-struct MLRMLR {
-    mlr: MLR,
+struct MLR {
+    mlr: MLRControl,
     audio_clock: ClockConsumer,
     pattern: Vec<(usize, MLRAction)>,
     recording_end: Option<usize>,
@@ -548,9 +546,9 @@ struct MLRMLR {
     state_tracker: GridStateTracker
 }
 
-impl MLRMLR {
-    fn new(mlr: MLR, state_tracker: GridStateTracker, audio_clock: ClockConsumer) -> MLRMLR {
-        MLRMLR {
+impl MLR {
+    fn new(mlr: MLRControl, state_tracker: GridStateTracker, audio_clock: ClockConsumer) -> MLR {
+        MLR {
             mlr,
             audio_clock,
             pattern:  Vec::new(),
@@ -874,10 +872,10 @@ fn main() {
     stream.start().unwrap();
 
     let clock2 = clock_receiver.clone();
-    let mut mlr = MLR::new(sender, tracks_meta, clock_receiver);
+    let mut mlr = MLRControl::new(sender, tracks_meta, clock_receiver);
     let state_tracker = GridStateTracker::new(16, 8);
 
-    let mut mlrmlr = MLRMLR::new(mlr, state_tracker, clock2);
+    let mut mlrmlr = MLR::new(mlr, state_tracker, clock2);
 
     mlrmlr.main_loop();
 }
