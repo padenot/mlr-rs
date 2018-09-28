@@ -703,6 +703,104 @@ impl MLRMLR {
     }
 }
 
+struct MLRRenderer {
+  tracks: Vec<MLRTrack>,
+  rx: std::sync::Arc<Mutex<std::sync::mpsc::Receiver<Message>>>
+}
+
+impl MLRRenderer {
+    fn new(tracks: Vec<MLRTrack>, rx: std::sync::Arc<Mutex<std::sync::mpsc::Receiver<Message>>>) -> MLRRenderer {
+        MLRRenderer {
+            tracks,
+            rx
+        }
+    }
+
+    fn render(&mut self, output: &mut [f32]) {
+        let mut m = Mixer::new(output);
+        loop {
+            match self.rx.lock().unwrap().try_recv() {
+                Ok(msg) => {
+                    match msg {
+                        Message::Enable(track) => {
+                            if track as usize > self.tracks.len() {
+                                info!("msg to track not loaded");
+                                continue;
+                            }
+                            self.tracks[track as usize].start();
+                            info!("starting {}", self.tracks[track as usize].name());
+                        }
+                        Message::Disable(track) => {
+                            if track as usize > self.tracks.len() {
+                                info!("msg to track not loaded");
+                                continue;
+                            }
+                            self.tracks[track as usize].stop();
+                            info!("stopping {}", self.tracks[track as usize].name());
+                        }
+                        Message::SetHead((track, pos)) => {
+                            if track as usize > self.tracks.len() {
+                                info!("msg to track not loaded");
+                                continue;
+                            }
+                            self.tracks[track as usize].set_head(pos);
+                            info!("setting head for {} at {}", self.tracks[track as usize].name(), pos);
+                        }
+                        Message::SetStart((track, pos)) => {
+                            if track as usize > self.tracks.len() {
+                                info!("msg to track not loaded");
+                                continue;
+                            }
+                            info!("setting start point for {} at {}", self.tracks[track as usize].name(), pos);
+                            self.tracks[track as usize].set_start(pos);
+                        }
+                        Message::SetEnd((track, pos)) => {
+                            if track as usize > self.tracks.len() {
+                                info!("msg to track not loaded");
+                                continue;
+                            }
+                            info!("setting end point for {} at {}", self.tracks[track as usize].name(), pos);
+                            self.tracks[track as usize].set_stop(pos);
+                        }
+                        Message::SetDirection((track, direction)) => {
+                            if track as usize > self.tracks.len() {
+                                info!("msg to track not loaded");
+                                continue;
+                            }
+                            info!("setting direction for {} at to {:?}", self.tracks[track as usize].name(), direction);
+                            self.tracks[track as usize].set_direction(direction);
+                        }
+                        Message::GainChange((track, gain_delta)) => {
+                            if track as usize > self.tracks.len() {
+                                info!("msg to track not loaded");
+                                continue;
+                            }
+                            info!("adjust gain for {}, delta {}", self.tracks[track as usize].name(), gain_delta);
+                            self.tracks[track as usize].adjust_gain(gain_delta);
+                        }
+                    }
+                },
+                Err(err) => {
+                    match err {
+                        std::sync::mpsc::TryRecvError::Empty => {
+                        }
+                        std::sync::mpsc::TryRecvError::Disconnected => {
+                            error!("disconnected");
+                        }
+                    }
+                }
+            }
+            let mut out: f32 = 0.0;
+            for i in self.tracks.iter_mut() {
+                m.mix_sample(i.extract());
+            }
+            if !m.next() {
+                break;
+            }
+        }
+    }
+}
+
 fn main() {
     pretty_env_logger::init();
 
@@ -743,6 +841,8 @@ fn main() {
     let (mut clock_updater, clock_receiver) = audio_clock(128., 48000);
     let rx = Arc::new(Mutex::new(receiver));
 
+    let mut renderer = MLRRenderer::new(tracks, rx);
+
     // set up audio output
     let ctx = cubeb::init("mlr-rs").expect("Failed to create cubeb context");
     let params = cubeb::StreamParamsBuilder::new()
@@ -760,89 +860,7 @@ fn main() {
         .default_output(&params)
         .latency(256)
         .data_callback(move |_input: &[f32], output| {
-            {
-                let mut m = Mixer::new(output);
-                loop {
-                    match rx.lock().unwrap().try_recv() {
-                        Ok(msg) => {
-                            match msg {
-                                Message::Enable(track) => {
-                                    if track as usize > tracks.len() {
-                                        info!("msg to track not loaded");
-                                        continue;
-                                    }
-                                    tracks[track as usize].start();
-                                    info!("starting {}", tracks[track as usize].name());
-                                }
-                                Message::Disable(track) => {
-                                    if track as usize > tracks.len() {
-                                        info!("msg to track not loaded");
-                                        continue;
-                                    }
-                                    tracks[track as usize].stop();
-                                    info!("stopping {}", tracks[track as usize].name());
-                                }
-                                Message::SetHead((track, pos)) => {
-                                    if track as usize > tracks.len() {
-                                        info!("msg to track not loaded");
-                                        continue;
-                                    }
-                                    tracks[track as usize].set_head(pos);
-                                    info!("setting head for {} at {}", tracks[track as usize].name(), pos);
-                                }
-                                Message::SetStart((track, pos)) => {
-                                    if track as usize > tracks.len() {
-                                        info!("msg to track not loaded");
-                                        continue;
-                                    }
-                                    info!("setting start point for {} at {}", tracks[track as usize].name(), pos);
-                                    tracks[track as usize].set_start(pos);
-                                }
-                                Message::SetEnd((track, pos)) => {
-                                    if track as usize > tracks.len() {
-                                        info!("msg to track not loaded");
-                                        continue;
-                                    }
-                                    info!("setting end point for {} at {}", tracks[track as usize].name(), pos);
-                                    tracks[track as usize].set_stop(pos);
-                                }
-                                Message::SetDirection((track, direction)) => {
-                                    if track as usize > tracks.len() {
-                                        info!("msg to track not loaded");
-                                        continue;
-                                    }
-                                    info!("setting direction for {} at to {:?}", tracks[track as usize].name(), direction);
-                                    tracks[track as usize].set_direction(direction);
-                                }
-                                Message::GainChange((track, gain_delta)) => {
-                                    if track as usize > tracks.len() {
-                                        info!("msg to track not loaded");
-                                        continue;
-                                    }
-                                    info!("adjust gain for {}, delta {}", tracks[track as usize].name(), gain_delta);
-                                    tracks[track as usize].adjust_gain(gain_delta);
-                                }
-                            }
-                        },
-                        Err(err) => {
-                            match err {
-                                std::sync::mpsc::TryRecvError::Empty => {
-                                }
-                                std::sync::mpsc::TryRecvError::Disconnected => {
-                                    error!("disconnected");
-                                }
-                            }
-                        }
-                    }
-                    let mut out: f32 = 0.0;
-                    for i in tracks.iter_mut() {
-                        m.mix_sample(i.extract());
-                    }
-                    if !m.next() {
-                        break;
-                    }
-                }
-            }
+            renderer.render(output);
             clock_updater.increment(output.len());
             output.len() as isize
         })
