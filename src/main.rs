@@ -6,6 +6,7 @@ extern crate cubeb;
 extern crate monome;
 extern crate timer;
 extern crate chrono;
+extern crate audio_clock;
 
 use std::fs;
 use std::fs::DirEntry;
@@ -17,6 +18,7 @@ use std::time::Duration;
 use std::ops::Index;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use audio_clock::*;
 
 use monome::{Monome, MonomeEvent, KeyDirection};
 
@@ -270,48 +272,6 @@ impl<'a> Mixer<'a> {
 }
 
 
-struct ClockUpdater {
-    clock: Arc<AtomicUsize>
-}
-
-impl ClockUpdater {
-    fn increment(&mut self, frames: usize) {
-        self.clock.store(self.clock.load(Ordering::Relaxed) + frames, Ordering::Relaxed);
-    }
-}
-
-struct ClockConsumer {
-    clock: Arc<AtomicUsize>,
-    rate: u32,
-    tempo: f32
-}
-
-impl ClockConsumer {
-    fn raw_frames(&self) -> usize {
-        self.clock.load(Ordering::Relaxed)
-    }
-    fn beat(&self) -> f32 {
-        self.tempo / 60. * (self.raw_frames() as f32 / self.rate as f32)
-    }
-    fn beat_duration(&self) -> f32 {
-        self.tempo / 60.
-    }
-}
-
-impl Clone for ClockConsumer {
-    fn clone(&self) -> ClockConsumer {
-        ClockConsumer {
-            rate: self.rate,
-            tempo: self.tempo,
-            clock: self.clock.clone()
-        }
-    }
-}
-
-fn clock(tempo: f32, rate: u32) -> (ClockUpdater, ClockConsumer) {
-    let c = Arc::new(AtomicUsize::new(0));
-    (ClockUpdater { clock: c.clone() }, ClockConsumer { clock: c, tempo, rate })
-}
 
 
 fn usage() {
@@ -780,7 +740,7 @@ fn main() {
     }
 
     let (sender, receiver) = channel::<Message>();
-    let (mut clock_updater, clock_receiver) = clock(128., 48000);
+    let (mut clock_updater, clock_receiver) = audio_clock(128., 48000);
     let rx = Arc::new(Mutex::new(receiver));
 
     // set up audio output
