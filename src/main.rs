@@ -2,36 +2,34 @@ extern crate audrey;
 extern crate pretty_env_logger;
 #[macro_use]
 extern crate log;
+extern crate audio_clock;
+extern crate chrono;
 extern crate cubeb;
 extern crate monome;
 extern crate timer;
-extern crate chrono;
-extern crate audio_clock;
 
+use audio_clock::*;
+use std::cmp;
+use std::env;
 use std::fs;
 use std::fs::DirEntry;
-use std::env;
-use std::cmp;
-use std::thread;
-use std::sync::mpsc::{channel, Sender};
-use std::time::Duration;
 use std::ops::Index;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use audio_clock::*;
+use std::sync::mpsc::{channel, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
-use monome::{Monome, MonomeEvent, KeyDirection};
+use monome::{KeyDirection, Monome, MonomeEvent};
 
-struct MLRSample
-{
-  name: String,
-  channels: u32,
-  rate: u32,
-  data: Vec<f32>
+struct MLRSample {
+    name: String,
+    channels: u32,
+    rate: u32,
+    data: Vec<f32>,
 }
 
-impl MLRSample
-{
+impl MLRSample {
     fn new(path: &DirEntry) -> MLRSample {
         info!("Loading {:?}...", path.path());
         let mut file = audrey::read::open(&path.path()).unwrap();
@@ -41,10 +39,16 @@ impl MLRSample
             name: path.path().to_str().unwrap().to_string(),
             channels: desc.channel_count(),
             rate: desc.sample_rate(),
-            data
+            data,
         };
 
-        info!("Loaded file: {} channels: {}, duration: {}, rate: {}", s.name(), s.channels(), s.duration(), s.rate());
+        info!(
+            "Loaded file: {} channels: {}, duration: {}, rate: {}",
+            s.name(),
+            s.channels(),
+            s.duration(),
+            s.rate()
+        );
 
         return s;
     }
@@ -76,42 +80,43 @@ impl Index<usize> for MLRSample {
 #[derive(Debug, PartialEq, Clone)]
 enum PlaybackDirection {
     FORWARD,
-    BACKWARD
+    BACKWARD,
 }
 
-struct MLRTrack
-{
+struct MLRTrack {
     row_index: usize,
     playing: bool,
     current_pos: isize,
     sample: MLRSample,
     start_index: u32, // [0, 15]
-    stop_index: u32, // [0, 15], strictly greater than start
+    stop_index: u32,  // [0, 15], strictly greater than start
     direction: PlaybackDirection,
-    gain: f32
+    gain: f32,
 }
 
-struct MLRTrackMetadata
-{
+struct MLRTrackMetadata {
     row_index: usize,
     playing: bool,
     current_pos: isize,
     start_index: isize, // [0, 15]
-    stop_index: isize, // [0, 15], strictly greater than start
+    stop_index: isize,  // [0, 15], strictly greater than start
     direction: PlaybackDirection,
     frames: isize,
-    name: String
+    name: String,
 }
 
-impl MLRTrackMetadata
-{
+impl MLRTrackMetadata {
     fn update_pos(&mut self, diff: isize) {
         if !self.playing {
             return;
         }
         let min = self.index_to_frames(self.start_index);
         let max = self.index_to_frames(self.stop_index);
-        self.current_pos += if self.direction == PlaybackDirection::FORWARD { diff } else { -diff };
+        self.current_pos += if self.direction == PlaybackDirection::FORWARD {
+            diff
+        } else {
+            -diff
+        };
         if self.current_pos > max && self.direction == PlaybackDirection::FORWARD {
             self.current_pos = min + (self.current_pos - max);
         }
@@ -137,13 +142,13 @@ impl MLRTrackMetadata
     fn set_head(&mut self, index: isize) {
         self.current_pos = self.index_to_frames(index);
     }
-    fn set_direction(&mut self,direction: PlaybackDirection) {
+    fn set_direction(&mut self, direction: PlaybackDirection) {
         self.direction = direction;
     }
     fn frames_to_index(&self, frames: isize) -> isize {
         frames * 16 / self.frames
     }
-    fn index_to_frames(&self, index: isize) -> isize{
+    fn index_to_frames(&self, index: isize) -> isize {
         (self.frames / 16) * index
     }
     fn current_led(&self) -> isize {
@@ -164,8 +169,7 @@ impl MLRTrackMetadata
     }
 }
 
-impl MLRTrack
-{
+impl MLRTrack {
     fn new(row_index: usize, sample: MLRSample) -> MLRTrack {
         MLRTrack {
             row_index,
@@ -175,7 +179,7 @@ impl MLRTrack
             start_index: 0,
             stop_index: 16,
             direction: PlaybackDirection::FORWARD,
-            gain: 1.0
+            gain: 1.0,
         }
     }
     fn metadata(&self) -> MLRTrackMetadata {
@@ -187,7 +191,7 @@ impl MLRTrack
             stop_index: 16,
             frames: self.sample.frames() as isize,
             direction: PlaybackDirection::FORWARD,
-            name: self.name().clone().to_string()
+            name: self.name().clone().to_string(),
         }
     }
     fn start(&mut self) {
@@ -209,29 +213,33 @@ impl MLRTrack
         self.direction = direction;
     }
     fn adjust_gain(&mut self, gain_delta: i32) {
-      self.gain += gain_delta as f32 / 10.;
+        self.gain += gain_delta as f32 / 10.;
     }
     fn index_to_frames(sample: &MLRSample, index: u32) -> isize {
         (index * (sample.frames() as u32 / 16)) as isize
     }
     fn silence(data: &mut Vec<f32>) {
-        data.iter_mut().for_each(move |v| *v = 0.0 );
+        data.iter_mut().for_each(move |v| *v = 0.0);
     }
     fn extract(&mut self) -> f32 {
-      if !self.playing {
-          return 0.0;
-      }
-      let end_in_frames = Self::index_to_frames(&self.sample, self.stop_index) - 1;
-      let begining_in_frames = Self::index_to_frames(&self.sample, self.start_index);
-      let data = self.sample[self.current_pos as usize] * self.gain;
-      self.current_pos += if self.direction == PlaybackDirection::FORWARD { 1 } else { -1 };
-      if self.current_pos > end_in_frames && self.direction == PlaybackDirection::FORWARD {
-          self.current_pos = begining_in_frames;
-      }
-      if self.current_pos < begining_in_frames && self.direction == PlaybackDirection::BACKWARD {
-          self.current_pos = end_in_frames;
-      }
-      return data;
+        if !self.playing {
+            return 0.0;
+        }
+        let end_in_frames = Self::index_to_frames(&self.sample, self.stop_index) - 1;
+        let begining_in_frames = Self::index_to_frames(&self.sample, self.start_index);
+        let data = self.sample[self.current_pos as usize] * self.gain;
+        self.current_pos += if self.direction == PlaybackDirection::FORWARD {
+            1
+        } else {
+            -1
+        };
+        if self.current_pos > end_in_frames && self.direction == PlaybackDirection::FORWARD {
+            self.current_pos = begining_in_frames;
+        }
+        if self.current_pos < begining_in_frames && self.direction == PlaybackDirection::BACKWARD {
+            self.current_pos = end_in_frames;
+        }
+        return data;
     }
     fn name(&self) -> &str {
         self.sample.name()
@@ -239,43 +247,37 @@ impl MLRTrack
 }
 
 struct Mixer<'a> {
-  out: &'a mut [f32],
-  offset: usize
+    out: &'a mut [f32],
+    offset: usize,
 }
 
 impl<'a> Mixer<'a> {
-  fn new(out: &'a mut [f32]) -> Mixer<'a> {
-      for i in 0..out.len() {
-          out[i] = 0.0;
-      }
-      Mixer {
-          out,
-          offset: 0
-      }
-  }
-  fn mix(&mut self, input: &Vec<f32>) {
-      assert!(self.offset == 0);
-      for i in 0..input.len() {
-          self.out[i] += input[i];
-      }
-  }
-  fn mix_sample(&mut self, input: f32) {
-      self.out[self.offset] += input;
-  }
-  fn next(&mut self) -> bool {
-      if self.offset == self.out.len() - 1 {
-          return false;
-      }
-      self.offset += 1;
-      return true;
-  }
+    fn new(out: &'a mut [f32]) -> Mixer<'a> {
+        for i in 0..out.len() {
+            out[i] = 0.0;
+        }
+        Mixer { out, offset: 0 }
+    }
+    fn mix(&mut self, input: &Vec<f32>) {
+        assert!(self.offset == 0);
+        for i in 0..input.len() {
+            self.out[i] += input[i];
+        }
+    }
+    fn mix_sample(&mut self, input: f32) {
+        self.out[self.offset] += input;
+    }
+    fn next(&mut self) -> bool {
+        if self.offset == self.out.len() - 1 {
+            return false;
+        }
+        self.offset += 1;
+        return true;
+    }
 }
 
-
-
-
 fn usage() {
-  println!("USAGE: mlr-rs <directory containing samples>");
+    println!("USAGE: mlr-rs <directory containing samples>");
 }
 
 fn validate_files(files: &Vec<MLRSample>) -> bool {
@@ -285,13 +287,23 @@ fn validate_files(files: &Vec<MLRSample>) -> bool {
 
     for f in files.iter().skip(1) {
         if rate != f.rate() {
-            error!("rate issue with {}: expected {} but found {}", f.name(), rate, f.rate());
+            error!(
+                "rate issue with {}: expected {} but found {}",
+                f.name(),
+                rate,
+                f.rate()
+            );
             return false;
         }
         let longest = cmp::max(duration, f.frames());
         let shortest = cmp::min(duration, f.frames());
         if longest % shortest != 0 {
-            error!("duration issue with {}: expected a multiple or divisor of {} but found {}", f.name(), duration, f.frames());
+            error!(
+                "duration issue with {}: expected a multiple or divisor of {} but found {}",
+                f.name(),
+                duration,
+                f.frames()
+            );
             return false;
         }
     }
@@ -299,60 +311,60 @@ fn validate_files(files: &Vec<MLRSample>) -> bool {
 }
 
 #[derive(Clone, PartialEq)]
-enum MLRIntent
-{
+enum MLRIntent {
     Nothing,
     Trigger,
-    Loop
+    Loop,
 }
 #[derive(Debug, Copy, Clone)]
-enum MLRAction
-{
+enum MLRAction {
     Nothing,
     Trigger((usize, usize)),
     Loop((usize, usize, usize)),
     GainChange((usize, i32)),
     TrackStatus(usize),
-    Pattern(u8)
+    Pattern(u8),
 }
 
 struct GridStateTracker {
     buttons: Vec<MLRIntent>,
     width: usize,
-    height: usize
+    height: usize,
 }
-
 
 // state tracker for grid action on the botton rows
 impl GridStateTracker {
     fn new(width: usize, height: usize) -> GridStateTracker {
-      GridStateTracker {
-          width,
-          height,
-          buttons: vec![MLRIntent::Nothing; width * height]
-      }
+        GridStateTracker {
+            width,
+            height,
+            buttons: vec![MLRIntent::Nothing; width * height],
+        }
     }
     fn down(&mut self, x: usize, y: usize) {
-      if y == 0 { // control row
-          self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Trigger;
-      } else { // track rows
-          // If, when pressing down, we find another button on the same line already down, this is a
-          // loop.
-          let mut foundanother = false;
-          for i  in 0..self.width {
-              if self.buttons[Self::idx(self.width, i, y)] != MLRIntent::Nothing {
-                  self.buttons[Self::idx(self.width, i, y)] = MLRIntent::Loop;
-                  self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Loop;
-                  foundanother = true;
-              }
-          }
-          if !foundanother {
-              self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Trigger;
-          }
-      }
+        if y == 0 {
+            // control row
+            self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Trigger;
+        } else {
+            // track rows
+            // If, when pressing down, we find another button on the same line already down, this is a
+            // loop.
+            let mut foundanother = false;
+            for i in 0..self.width {
+                if self.buttons[Self::idx(self.width, i, y)] != MLRIntent::Nothing {
+                    self.buttons[Self::idx(self.width, i, y)] = MLRIntent::Loop;
+                    self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Loop;
+                    foundanother = true;
+                }
+            }
+            if !foundanother {
+                self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Trigger;
+            }
+        }
     }
     fn up(&mut self, x: usize, y: usize) -> MLRAction {
-        if y == 0 { // control row
+        if y == 0 {
+            // control row
             // is mod 1 (8th button) or mod 2 (9th button) down
             let mut gain_delta = 0;
             if self.buttons[Self::idx(self.width, 7, y)] != MLRIntent::Nothing {
@@ -363,21 +375,22 @@ impl GridStateTracker {
             }
             if gain_delta != 0 {
                 self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Nothing;
-                return MLRAction::GainChange((x, gain_delta))
+                return MLRAction::GainChange((x, gain_delta));
             }
             if self.buttons[Self::idx(self.width, 14, y)] != MLRIntent::Nothing {
                 println!("pattern 0");
                 self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Nothing;
-                return MLRAction::Pattern(0)
+                return MLRAction::Pattern(0);
             }
             if self.buttons[Self::idx(self.width, 15, y)] != MLRIntent::Nothing {
                 println!("pattern 1");
                 self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Nothing;
-                return MLRAction::Pattern(1)
+                return MLRAction::Pattern(1);
             }
             self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Nothing;
             MLRAction::TrackStatus(x)
-        } else { // tracks rows
+        } else {
+            // tracks rows
             match self.buttons[Self::idx(self.width, x, y)].clone() {
                 MLRIntent::Nothing => {
                     /* someone pressed a key during startup */
@@ -385,7 +398,7 @@ impl GridStateTracker {
                 }
                 MLRIntent::Trigger => {
                     self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Nothing;
-                    MLRAction::Trigger((x ,y))
+                    MLRAction::Trigger((x, y))
                 }
                 MLRIntent::Loop => {
                     // Find the other button that is down, if we find one that if intended for looping,
@@ -402,29 +415,34 @@ impl GridStateTracker {
 
                     match other {
                         Some(i) => MLRAction::Loop((y, x, i)),
-                        None => MLRAction::Nothing
+                        None => MLRAction::Nothing,
                     }
                 }
             }
         }
     }
     fn idx(width: usize, x: usize, y: usize) -> usize {
-      y * width + x
+        y * width + x
     }
     fn dump(&self) {
         for i in 0..self.height {
             for j in 0..self.width {
                 match self.buttons[Self::idx(self.width, j, i)] {
-                    MLRIntent::Nothing => { print!(" "); }
-                    MLRIntent::Trigger => { print!("T"); }
-                    MLRIntent::Loop => { print!("L"); }
+                    MLRIntent::Nothing => {
+                        print!(" ");
+                    }
+                    MLRIntent::Trigger => {
+                        print!("T");
+                    }
+                    MLRIntent::Loop => {
+                        print!("L");
+                    }
                 }
             }
             println!(" ");
         }
     }
 }
-
 
 #[derive(Debug)]
 enum Message {
@@ -434,7 +452,7 @@ enum Message {
     SetStart((usize, u32)),
     SetEnd((usize, u32)),
     SetDirection((usize, PlaybackDirection)),
-    GainChange((usize, i32))
+    GainChange((usize, i32)),
 }
 
 struct MLR {
@@ -451,12 +469,11 @@ struct MLR {
     pattern_playback: bool,
     pattern_index: usize,
     pattern_rec_time_end: usize,
-    state_tracker: GridStateTracker
+    state_tracker: GridStateTracker,
 }
 
 impl MLR {
     fn new(audio_clock: ClockConsumer) -> (MLR, MLRRenderer) {
-
         let (sender, receiver) = channel::<Message>();
         let rx = Arc::new(Mutex::new(receiver));
 
@@ -479,11 +496,11 @@ impl MLR {
         let mut tracks_meta: Vec<MLRTrackMetadata> = Vec::new();
         let mut row = 0;
         for _i in 0..samples.len() {
-          let s = samples.remove(0);
-          let t = MLRTrack::new(row, s);
-          tracks_meta.push(t.metadata());
-          tracks.push(t);
-          row += 1;
+            let s = samples.remove(0);
+            let t = MLRTrack::new(row, s);
+            tracks_meta.push(t.metadata());
+            tracks.push(t);
+            row += 1;
         }
 
         let mut renderer = MLRRenderer::new(tracks, rx);
@@ -495,28 +512,31 @@ impl MLR {
         let mut monome = Monome::new("/mlr-rs").unwrap();
         monome.all(false);
 
-        (MLR {
-            sender,
-            tracks_meta,
-            previous_time: 0,
-            leds,
-            monome,
-            audio_clock,
-            pattern:  Vec::new(),
-            recording_end: None,
-            pattern_duration_frames: (60. / 128. * 4. * 48000.) as usize,
-            recording_pattern: false,
-            pattern_playback: false,
-            pattern_index: 0,
-            pattern_rec_time_end: 0,
-            state_tracker
-        }, renderer)
+        (
+            MLR {
+                sender,
+                tracks_meta,
+                previous_time: 0,
+                leds,
+                monome,
+                audio_clock,
+                pattern: Vec::new(),
+                recording_end: None,
+                pattern_duration_frames: (60. / 128. * 4. * 48000.) as usize,
+                recording_pattern: false,
+                pattern_playback: false,
+                pattern_index: 0,
+                pattern_rec_time_end: 0,
+                state_tracker,
+            },
+            renderer,
+        )
     }
     fn track_length(&self) -> u32 {
-      self.monome.width() as u32
+        self.monome.width() as u32
     }
     fn track_max(&self) -> u32 {
-      self.monome.height() as u32
+        self.monome.height() as u32
     }
     fn start(&mut self, track_index: usize) {
         if !self.tracks_meta[track_index].enabled() {
@@ -533,24 +553,34 @@ impl MLR {
         }
     }
     fn set_head(&mut self, track_index: usize, head_pos: isize) {
-        self.sender.send(Message::SetHead((track_index, head_pos as u32))).unwrap();
+        self.sender
+            .send(Message::SetHead((track_index, head_pos as u32)))
+            .unwrap();
         self.tracks_meta[track_index as usize].set_head(head_pos as isize);
         self.monome.set(track_index as i32, 0, true);
     }
     fn set_start(&mut self, track_index: usize, start: usize) {
-        self.sender.send(Message::SetStart((track_index, start as u32))).unwrap();
+        self.sender
+            .send(Message::SetStart((track_index, start as u32)))
+            .unwrap();
         self.tracks_meta[track_index].set_start(start as isize);
     }
     fn set_end(&mut self, track_index: usize, end: usize) {
-        self.sender.send(Message::SetEnd((track_index, end as u32))).unwrap();
+        self.sender
+            .send(Message::SetEnd((track_index, end as u32)))
+            .unwrap();
         self.tracks_meta[track_index].set_stop(end as isize);
     }
     fn set_direction(&mut self, track_index: usize, direction: PlaybackDirection) {
-        self.sender.send(Message::SetDirection((track_index, direction.clone()))).unwrap();
+        self.sender
+            .send(Message::SetDirection((track_index, direction.clone())))
+            .unwrap();
         self.tracks_meta[track_index].set_direction(direction);
     }
     fn change_gain(&mut self, track_index: usize, gain_delta: i32) {
-        self.sender.send(Message::GainChange((track_index, gain_delta))).unwrap();
+        self.sender
+            .send(Message::GainChange((track_index, gain_delta)))
+            .unwrap();
     }
     fn enabled(&mut self, track_index: usize) -> bool {
         self.tracks_meta[track_index].enabled()
@@ -572,15 +602,20 @@ impl MLR {
             self.monome.set(14, 0, true);
         }
         let current_time = self.audio_clock.raw_frames();
-        let diff = (current_time - self.previous_time)  as isize;
+        let diff = (current_time - self.previous_time) as isize;
         for t in self.tracks_meta.iter_mut() {
             t.update_pos(diff);
             if t.enabled() {
                 let current_led = t.current_led();
                 if self.leds[t.row_index()] != current_led as i32 && t.enabled() {
-                    self.monome.set(self.leds[t.row_index()] as i32, t.row_index() as i32 + 1, false);
+                    self.monome.set(
+                        self.leds[t.row_index()] as i32,
+                        t.row_index() as i32 + 1,
+                        false,
+                    );
                     self.leds[t.row_index()] = current_led as i32;
-                    self.monome.set(t.current_led() as i32, t.row_index() as i32 + 1, true);
+                    self.monome
+                        .set(t.current_led() as i32, t.row_index() as i32 + 1, true);
                 }
             }
         }
@@ -595,7 +630,7 @@ impl MLR {
             MLRAction::Pattern(pattern) => {
                 self.recording_pattern = false;
             }
-            _ => { }
+            _ => {}
         }
 
         if self.recording_pattern {
@@ -658,34 +693,37 @@ impl MLR {
             MLRAction::Pattern(pattern) => {
                 self.recording_pattern = true;
             }
-            MLRAction::Nothing => {
-            }
+            MLRAction::Nothing => {}
         }
     }
     fn main_thread_work(&mut self) {
         if self.pattern_playback {
-            debug!("pattern[{}].begin: {:?}, offset: {}, end: {}",
-                   self.pattern_index,
-                   self.pattern[self.pattern_index].0,
-                   self.audio_clock.raw_frames() - self.pattern_rec_time_end,
-                   self.pattern_duration_frames);
+            debug!(
+                "pattern[{}].begin: {:?}, offset: {}, end: {}",
+                self.pattern_index,
+                self.pattern[self.pattern_index].0,
+                self.audio_clock.raw_frames() - self.pattern_rec_time_end,
+                self.pattern_duration_frames
+            );
             // this is the clock time, between 0 and the duration of a row, 0 being the
             // start time of a loop of a pattern.
-            let clock_in_pattern = (self.audio_clock.raw_frames() - self.pattern_rec_time_end) % self.pattern_duration_frames;
+            let clock_in_pattern = (self.audio_clock.raw_frames() - self.pattern_rec_time_end)
+                % self.pattern_duration_frames;
             // if the current time is later than the current action time in the pattern,
             // and we're not playing after the last pattern item (waiting to loop, pattern
             // index being zero and clock time being past the last item start time),
             // trigger the action and move to the next pattern item. If we're past the end,
             // wrap around in the pattern array.
-            if clock_in_pattern > self.pattern[self.pattern_index].0 &&
-                !(self.pattern_index == 0 && clock_in_pattern > self.pattern.last().unwrap().0) {
-                    let action = self.pattern[self.pattern_index].1.clone();
-                    self.pattern_index += 1;
-                    if self.pattern_index == self.pattern.len() {
-                        self.pattern_index = 0;
-                    }
-                    self.handle_action(action);
+            if clock_in_pattern > self.pattern[self.pattern_index].0
+                && !(self.pattern_index == 0 && clock_in_pattern > self.pattern.last().unwrap().0)
+            {
+                let action = self.pattern[self.pattern_index].1.clone();
+                self.pattern_index += 1;
+                if self.pattern_index == self.pattern.len() {
+                    self.pattern_index = 0;
                 }
+                self.handle_action(action);
+            }
         }
 
         match self.recording_end {
@@ -704,25 +742,22 @@ impl MLR {
                     }
                 }
             }
-            _  => {
-            }
+            _ => {}
         }
     }
 
     fn poll_input(&mut self) {
         loop {
             match self.poll() {
-                Some(MonomeEvent::GridKey{x, y, direction}) => {
-                    match direction {
-                        KeyDirection::Down => {
-                            self.state_tracker.down(x as usize, y as usize);
-                        },
-                        KeyDirection::Up => {
-                            let action = self.state_tracker.up(x as usize, y as usize);
-                            self.handle_action(action);
-                        }
+                Some(MonomeEvent::GridKey { x, y, direction }) => match direction {
+                    KeyDirection::Down => {
+                        self.state_tracker.down(x as usize, y as usize);
                     }
-                }
+                    KeyDirection::Up => {
+                        let action = self.state_tracker.up(x as usize, y as usize);
+                        self.handle_action(action);
+                    }
+                },
                 Some(_) => {
                     break;
                 }
@@ -738,91 +773,106 @@ impl MLR {
 }
 
 struct MLRRenderer {
-  tracks: Vec<MLRTrack>,
-  rx: std::sync::Arc<Mutex<std::sync::mpsc::Receiver<Message>>>
+    tracks: Vec<MLRTrack>,
+    rx: std::sync::Arc<Mutex<std::sync::mpsc::Receiver<Message>>>,
 }
 
 impl MLRRenderer {
-    fn new(tracks: Vec<MLRTrack>, rx: std::sync::Arc<Mutex<std::sync::mpsc::Receiver<Message>>>) -> MLRRenderer {
-        MLRRenderer {
-            tracks,
-            rx
-        }
+    fn new(
+        tracks: Vec<MLRTrack>,
+        rx: std::sync::Arc<Mutex<std::sync::mpsc::Receiver<Message>>>,
+    ) -> MLRRenderer {
+        MLRRenderer { tracks, rx }
     }
 
     fn render(&mut self, output: &mut [f32]) {
         let mut m = Mixer::new(output);
         loop {
             match self.rx.lock().unwrap().try_recv() {
-                Ok(msg) => {
-                    match msg {
-                        Message::Enable(track) => {
-                            if track as usize > self.tracks.len() {
-                                info!("msg to track not loaded");
-                                continue;
-                            }
-                            self.tracks[track as usize].start();
-                            info!("starting {}", self.tracks[track as usize].name());
+                Ok(msg) => match msg {
+                    Message::Enable(track) => {
+                        if track as usize > self.tracks.len() {
+                            info!("msg to track not loaded");
+                            continue;
                         }
-                        Message::Disable(track) => {
-                            if track as usize > self.tracks.len() {
-                                info!("msg to track not loaded");
-                                continue;
-                            }
-                            self.tracks[track as usize].stop();
-                            info!("stopping {}", self.tracks[track as usize].name());
+                        self.tracks[track as usize].start();
+                        info!("starting {}", self.tracks[track as usize].name());
+                    }
+                    Message::Disable(track) => {
+                        if track as usize > self.tracks.len() {
+                            info!("msg to track not loaded");
+                            continue;
                         }
-                        Message::SetHead((track, pos)) => {
-                            if track as usize > self.tracks.len() {
-                                info!("msg to track not loaded");
-                                continue;
-                            }
-                            self.tracks[track as usize].set_head(pos);
-                            info!("setting head for {} at {}", self.tracks[track as usize].name(), pos);
+                        self.tracks[track as usize].stop();
+                        info!("stopping {}", self.tracks[track as usize].name());
+                    }
+                    Message::SetHead((track, pos)) => {
+                        if track as usize > self.tracks.len() {
+                            info!("msg to track not loaded");
+                            continue;
                         }
-                        Message::SetStart((track, pos)) => {
-                            if track as usize > self.tracks.len() {
-                                info!("msg to track not loaded");
-                                continue;
-                            }
-                            info!("setting start point for {} at {}", self.tracks[track as usize].name(), pos);
-                            self.tracks[track as usize].set_start(pos);
+                        self.tracks[track as usize].set_head(pos);
+                        info!(
+                            "setting head for {} at {}",
+                            self.tracks[track as usize].name(),
+                            pos
+                        );
+                    }
+                    Message::SetStart((track, pos)) => {
+                        if track as usize > self.tracks.len() {
+                            info!("msg to track not loaded");
+                            continue;
                         }
-                        Message::SetEnd((track, pos)) => {
-                            if track as usize > self.tracks.len() {
-                                info!("msg to track not loaded");
-                                continue;
-                            }
-                            info!("setting end point for {} at {}", self.tracks[track as usize].name(), pos);
-                            self.tracks[track as usize].set_stop(pos);
+                        info!(
+                            "setting start point for {} at {}",
+                            self.tracks[track as usize].name(),
+                            pos
+                        );
+                        self.tracks[track as usize].set_start(pos);
+                    }
+                    Message::SetEnd((track, pos)) => {
+                        if track as usize > self.tracks.len() {
+                            info!("msg to track not loaded");
+                            continue;
                         }
-                        Message::SetDirection((track, direction)) => {
-                            if track as usize > self.tracks.len() {
-                                info!("msg to track not loaded");
-                                continue;
-                            }
-                            info!("setting direction for {} at to {:?}", self.tracks[track as usize].name(), direction);
-                            self.tracks[track as usize].set_direction(direction);
+                        info!(
+                            "setting end point for {} at {}",
+                            self.tracks[track as usize].name(),
+                            pos
+                        );
+                        self.tracks[track as usize].set_stop(pos);
+                    }
+                    Message::SetDirection((track, direction)) => {
+                        if track as usize > self.tracks.len() {
+                            info!("msg to track not loaded");
+                            continue;
                         }
-                        Message::GainChange((track, gain_delta)) => {
-                            if track as usize > self.tracks.len() {
-                                info!("msg to track not loaded");
-                                continue;
-                            }
-                            info!("adjust gain for {}, delta {}", self.tracks[track as usize].name(), gain_delta);
-                            self.tracks[track as usize].adjust_gain(gain_delta);
+                        info!(
+                            "setting direction for {} at to {:?}",
+                            self.tracks[track as usize].name(),
+                            direction
+                        );
+                        self.tracks[track as usize].set_direction(direction);
+                    }
+                    Message::GainChange((track, gain_delta)) => {
+                        if track as usize > self.tracks.len() {
+                            info!("msg to track not loaded");
+                            continue;
                         }
+                        info!(
+                            "adjust gain for {}, delta {}",
+                            self.tracks[track as usize].name(),
+                            gain_delta
+                        );
+                        self.tracks[track as usize].adjust_gain(gain_delta);
                     }
                 },
-                Err(err) => {
-                    match err {
-                        std::sync::mpsc::TryRecvError::Empty => {
-                        }
-                        std::sync::mpsc::TryRecvError::Disconnected => {
-                            error!("disconnected");
-                        }
+                Err(err) => match err {
+                    std::sync::mpsc::TryRecvError::Empty => {}
+                    std::sync::mpsc::TryRecvError::Disconnected => {
+                        error!("disconnected");
                     }
-                }
+                },
             }
             let mut out: f32 = 0.0;
             for i in self.tracks.iter_mut() {
@@ -837,7 +887,6 @@ impl MLRRenderer {
 
 fn main() {
     pretty_env_logger::init();
-
 
     let (mut clock_updater, clock_receiver) = audio_clock(128., 48000);
 
@@ -862,9 +911,9 @@ fn main() {
             clock_updater.increment(output.len());
             output.len() as isize
         })
-    .state_callback(|state| {
-        info!("stream {:?}", state);
-    });
+        .state_callback(|state| {
+            info!("stream {:?}", state);
+        });
 
     let stream = builder.init(&ctx).expect("Failed to create cubeb stream");
 
