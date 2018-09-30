@@ -362,12 +362,17 @@ impl GridStateTracker {
                 gain_delta = 1;
             }
             if gain_delta != 0 {
+                self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Nothing;
                 return MLRAction::GainChange((x, gain_delta))
             }
             if self.buttons[Self::idx(self.width, 14, y)] != MLRIntent::Nothing {
+                println!("pattern 0");
+                self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Nothing;
                 return MLRAction::Pattern(0)
             }
             if self.buttons[Self::idx(self.width, 15, y)] != MLRIntent::Nothing {
+                println!("pattern 1");
+                self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Nothing;
                 return MLRAction::Pattern(1)
             }
             self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Nothing;
@@ -432,31 +437,80 @@ enum Message {
     GainChange((usize, i32))
 }
 
-// This allows keeping the state of the grid on the main thread and sending off the commands to the
-// audio callback.
-struct MLRControl {
+struct MLR {
     sender: Sender<Message>,
     tracks_meta: Vec<MLRTrackMetadata>,
-    clock_receiver: ClockConsumer,
     previous_time: usize,
     leds: Vec<i32>,
-    monome: Monome
+    monome: Monome,
+    audio_clock: ClockConsumer,
+    pattern: Vec<(usize, MLRAction)>,
+    recording_end: Option<usize>,
+    pattern_duration_frames: usize,
+    recording_pattern: bool,
+    pattern_playback: bool,
+    pattern_index: usize,
+    pattern_rec_time_end: usize,
+    state_tracker: GridStateTracker
 }
 
-impl MLRControl {
-    fn new(sender: Sender<Message>, tracks_meta: Vec<MLRTrackMetadata>, clock_receiver: ClockConsumer) -> MLRControl {
+impl MLR {
+    fn new(audio_clock: ClockConsumer) -> (MLR, MLRRenderer) {
+
+        let (sender, receiver) = channel::<Message>();
+        let rx = Arc::new(Mutex::new(receiver));
+
+        let paths = fs::read_dir("mlr-samples").unwrap();
+
+        let mut samples: Vec<MLRSample> = Vec::new();
+
+        for path in paths {
+            let path = path.unwrap();
+            samples.push(MLRSample::new(&path));
+        }
+
+        if !validate_files(&samples) {
+            std::process::exit(1);
+        }
+
+        let common_rate = samples[0].rate();
+
+        let mut tracks: Vec<MLRTrack> = Vec::new();
+        let mut tracks_meta: Vec<MLRTrackMetadata> = Vec::new();
+        let mut row = 0;
+        for _i in 0..samples.len() {
+          let s = samples.remove(0);
+          let t = MLRTrack::new(row, s);
+          tracks_meta.push(t.metadata());
+          tracks.push(t);
+          row += 1;
+        }
+
+        let mut renderer = MLRRenderer::new(tracks, rx);
+
+        let state_tracker = GridStateTracker::new(16, 8);
+
         let leds = vec![-1; 7];
 
         let mut monome = Monome::new("/mlr-rs").unwrap();
         monome.all(false);
-        MLRControl {
+
+        (MLR {
             sender,
             tracks_meta,
-            clock_receiver,
             previous_time: 0,
             leds,
-            monome
-        }
+            monome,
+            audio_clock,
+            pattern:  Vec::new(),
+            recording_end: None,
+            pattern_duration_frames: (60. / 128. * 4. * 48000.) as usize,
+            recording_pattern: false,
+            pattern_playback: false,
+            pattern_index: 0,
+            pattern_rec_time_end: 0,
+            state_tracker
+        }, renderer)
     }
     fn track_length(&self) -> u32 {
       self.monome.width() as u32
@@ -511,7 +565,13 @@ impl MLRControl {
         self.monome.set(14 + pattern_index as i32, 0, 8);
     }
     fn update_leds(&mut self) {
-        let current_time = self.clock_receiver.raw_frames();
+        if self.recording_pattern {
+            self.monome.set(14, 0, true);
+        }
+        if self.recording_pattern {
+            self.monome.set(14, 0, true);
+        }
+        let current_time = self.audio_clock.raw_frames();
         let diff = (current_time - self.previous_time)  as isize;
         for t in self.tracks_meta.iter_mut() {
             t.update_pos(diff);
@@ -525,155 +585,93 @@ impl MLRControl {
             }
         }
         self.previous_time = current_time;
-
     }
-
     fn poll(&mut self) -> Option<MonomeEvent> {
         self.monome.poll()
     }
-}
-
-struct MLR {
-    mlr: MLRControl,
-    audio_clock: ClockConsumer,
-    pattern: Vec<(usize, MLRAction)>,
-    recording_end: Option<usize>,
-    recording_duration_frames: usize,
-    recording: bool,
-    recording_playback: bool,
-    pattern_index: usize,
-    pattern_rec_time_end: usize,
-    state_tracker: GridStateTracker
-}
-
-impl MLR {
-    fn new(audio_clock: ClockConsumer) -> (MLR, MLRRenderer) {
-
-        let (sender, receiver) = channel::<Message>();
-        let rx = Arc::new(Mutex::new(receiver));
-
-        let paths = fs::read_dir("mlr-samples").unwrap();
-
-        let mut samples: Vec<MLRSample> = Vec::new();
-
-        for path in paths {
-            let path = path.unwrap();
-            samples.push(MLRSample::new(&path));
-        }
-
-        if !validate_files(&samples) {
-            std::process::exit(1);
-        }
-
-        let common_rate = samples[0].rate();
-
-        let mut tracks: Vec<MLRTrack> = Vec::new();
-        let mut tracks_meta: Vec<MLRTrackMetadata> = Vec::new();
-        let mut row = 0;
-        for _i in 0..samples.len() {
-          let s = samples.remove(0);
-          let t = MLRTrack::new(row, s);
-          tracks_meta.push(t.metadata());
-          tracks.push(t);
-          row += 1;
-        }
-
-        let mut renderer = MLRRenderer::new(tracks, rx);
-
-        let state_tracker = GridStateTracker::new(16, 8);
-
-        let mut mlr = MLRControl::new(sender, tracks_meta, audio_clock.clone());
-        (MLR {
-            mlr,
-            audio_clock,
-            pattern:  Vec::new(),
-            recording_end: None,
-            recording_duration_frames: (60. / 128. * 4. * 48000.) as usize,
-            recording: false,
-            recording_playback: false,
-            pattern_index: 0,
-            pattern_rec_time_end: 0,
-            state_tracker
-        }, renderer)
-    }
-    fn setup(&mut self) {
-    }
     fn handle_action(&mut self, action: MLRAction) {
-        if self.recording {
+        // If recording pattern but button has been pressed, stop recording a pattern.
+        match action {
+            MLRAction::Pattern(pattern) => {
+                self.recording_pattern = false;
+            }
+            _ => { }
+        }
+
+        if self.recording_pattern {
+            println!("recording_pattern");
             if self.pattern.len() == 0 {
                 let begin = self.audio_clock.raw_frames();
-                self.recording_end = Some(begin + self.recording_duration_frames);
-                println!("trigger: begin: {} / end: {} / duration: {}", begin, self.recording_end.unwrap(), self.recording_duration_frames);
+                self.recording_end = Some(begin + self.pattern_duration_frames);
                 self.pattern.clear();
             }
-            println!("{:?}", self.pattern);
             self.pattern.push((self.audio_clock.raw_frames(), action));
         }
 
         match action {
             MLRAction::Trigger((x, y)) => {
                 let track_index = y - 1;
-                if !self.mlr.track_loaded(track_index) {
+                if !self.track_loaded(track_index) {
                     return;
                 }
-                self.mlr.start(track_index);
-                self.mlr.set_head(track_index, x as isize);
-                self.mlr.set_start(track_index, 0);
-                self.mlr.set_end(track_index, 16);
-                self.mlr.set_direction(track_index, PlaybackDirection::FORWARD);
+                self.start(track_index);
+                self.set_head(track_index, x as isize);
+                self.set_start(track_index, 0);
+                self.set_end(track_index, 16);
+                self.set_direction(track_index, PlaybackDirection::FORWARD);
             }
             MLRAction::Loop((row, mut start, mut end)) => {
                 let track_index = row - 1;
-                if !self.mlr.track_loaded(track_index) {
+                if !self.track_loaded(track_index) {
                     return;
                 }
                 if start > end {
-                    self.mlr.set_direction(track_index, PlaybackDirection::BACKWARD);
-                    self.mlr.set_head(track_index, end as isize);
+                    self.set_direction(track_index, PlaybackDirection::BACKWARD);
+                    self.set_head(track_index, end as isize);
                 } else {
-                    self.mlr.set_direction(track_index, PlaybackDirection::FORWARD);
-                    self.mlr.set_head(track_index, start as isize);
+                    self.set_direction(track_index, PlaybackDirection::FORWARD);
+                    self.set_head(track_index, start as isize);
                 }
                 if start > end {
                     std::mem::swap(&mut start, &mut end);
                 }
-                self.mlr.set_start(track_index, start);
-                self.mlr.set_end(track_index, end);
-                self.mlr.start(track_index);
+                self.set_start(track_index, start);
+                self.set_end(track_index, end);
+                self.start(track_index);
             }
             MLRAction::GainChange((track_index, gain_delta)) => {
-                if !self.mlr.track_loaded(track_index) {
+                if !self.track_loaded(track_index) {
                     return;
                 }
-                self.mlr.change_gain(track_index, gain_delta);
+                self.change_gain(track_index, gain_delta);
             }
             MLRAction::TrackStatus(track_index) => {
-                if !self.mlr.track_loaded(track_index) {
+                if !self.track_loaded(track_index) {
                     return;
                 }
-                if self.mlr.enabled(track_index as usize) {
-                    self.mlr.stop(track_index as usize);
+                if self.enabled(track_index as usize) {
+                    self.stop(track_index as usize);
                 } else {
-                    self.mlr.start(track_index as usize);
+                    self.start(track_index as usize);
                 }
             }
             MLRAction::Pattern(pattern) => {
-                self.recording = true;
+                self.recording_pattern = true;
             }
             MLRAction::Nothing => {
             }
         }
     }
     fn main_thread_work(&mut self) {
-        if self.recording_playback {
+        if self.pattern_playback {
             debug!("pattern[{}].begin: {:?}, offset: {}, end: {}",
                    self.pattern_index,
                    self.pattern[self.pattern_index].0,
                    self.audio_clock.raw_frames() - self.pattern_rec_time_end,
-                   self.recording_duration_frames);
+                   self.pattern_duration_frames);
             // this is the clock time, between 0 and the duration of a row, 0 being the
             // start time of a loop of a pattern.
-            let clock_in_pattern = (self.audio_clock.raw_frames() - self.pattern_rec_time_end) % self.recording_duration_frames;
+            let clock_in_pattern = (self.audio_clock.raw_frames() - self.pattern_rec_time_end) % self.pattern_duration_frames;
             // if the current time is later than the current action time in the pattern,
             // and we're not playing after the last pattern item (waiting to loop, pattern
             // index being zero and clock time being past the last item start time),
@@ -692,17 +690,18 @@ impl MLR {
 
         match self.recording_end {
             Some(end) => {
+                println!("end: {}", end);
                 if end < self.audio_clock.raw_frames() {
+                    println!("recording end");
                     self.pattern_rec_time_end = self.audio_clock.raw_frames();
-                    self.recording = false;
+                    self.recording_pattern = false;
                     self.recording_end = None;
-                    self.recording_playback = true;
+                    self.pattern_playback = true;
                     let offset = self.pattern[0].0;
                     // normalize pattern with a 0 start
                     for i in 0..self.pattern.len() {
                         self.pattern[i].0 -= offset;
                     }
-                    println!("########### END {:?}", self.pattern);
                 }
             }
             _  => {
@@ -712,7 +711,7 @@ impl MLR {
 
     fn poll_input(&mut self) {
         loop {
-            match self.mlr.poll() {
+            match self.poll() {
                 Some(MonomeEvent::GridKey{x, y, direction}) => {
                     match direction {
                         KeyDirection::Down => {
@@ -734,10 +733,7 @@ impl MLR {
         }
     }
     fn render(&mut self) {
-        self.mlr.update_leds();
-    }
-
-    fn main_loop(&mut self) {
+        self.update_leds();
     }
 }
 
