@@ -378,12 +378,10 @@ impl GridStateTracker {
                 return MLRAction::GainChange((x, gain_delta));
             }
             if self.buttons[Self::idx(self.width, 14, y)] != MLRIntent::Nothing {
-                println!("pattern 0");
                 self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Nothing;
                 return MLRAction::Pattern(0);
             }
             if self.buttons[Self::idx(self.width, 15, y)] != MLRIntent::Nothing {
-                println!("pattern 1");
                 self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Nothing;
                 return MLRAction::Pattern(1);
             }
@@ -634,7 +632,6 @@ impl MLR {
         }
 
         if self.recording_pattern {
-            println!("recording_pattern");
             if self.pattern.len() == 0 {
                 let begin = self.audio_clock.raw_frames();
                 self.recording_end = Some(begin + self.pattern_duration_frames);
@@ -728,9 +725,7 @@ impl MLR {
 
         match self.recording_end {
             Some(end) => {
-                println!("end: {}", end);
                 if end < self.audio_clock.raw_frames() {
-                    println!("recording end");
                     self.pattern_rec_time_end = self.audio_clock.raw_frames();
                     self.recording_pattern = false;
                     self.recording_end = None;
