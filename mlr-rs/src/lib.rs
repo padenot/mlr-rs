@@ -1,14 +1,16 @@
 extern crate audrey;
-extern crate pretty_env_logger;
 #[macro_use]
 extern crate log;
 extern crate audio_clock;
 extern crate chrono;
-extern crate cubeb;
 extern crate monome;
 extern crate timer;
 
+use audrey::*;
 use audio_clock::*;
+use std::process;
+use std::mem;
+use std::sync;
 use std::cmp;
 use std::env;
 use std::fs;
@@ -453,7 +455,7 @@ enum Message {
     GainChange((usize, i32)),
 }
 
-struct MLR {
+pub struct MLR {
     sender: Sender<Message>,
     tracks_meta: Vec<MLRTrackMetadata>,
     previous_time: usize,
@@ -471,7 +473,7 @@ struct MLR {
 }
 
 impl MLR {
-    fn new(audio_clock: ClockConsumer) -> (MLR, MLRRenderer) {
+    pub fn new(audio_clock: ClockConsumer) -> (MLR, MLRRenderer) {
         let (sender, receiver) = channel::<Message>();
         let rx = Arc::new(Mutex::new(receiver));
 
@@ -485,7 +487,7 @@ impl MLR {
         }
 
         if !validate_files(&samples) {
-            std::process::exit(1);
+            process::exit(1);
         }
 
         let common_rate = samples[0].rate();
@@ -665,7 +667,7 @@ impl MLR {
                     self.set_head(track_index, start as isize);
                 }
                 if start > end {
-                    std::mem::swap(&mut start, &mut end);
+                    mem::swap(&mut start, &mut end);
                 }
                 self.set_start(track_index, start);
                 self.set_end(track_index, end);
@@ -693,7 +695,7 @@ impl MLR {
             MLRAction::Nothing => {}
         }
     }
-    fn main_thread_work(&mut self) {
+    pub fn main_thread_work(&mut self) {
         if self.pattern_playback {
             debug!(
                 "pattern[{}].begin: {:?}, offset: {}, end: {}",
@@ -741,7 +743,7 @@ impl MLR {
         }
     }
 
-    fn poll_input(&mut self) {
+    pub fn poll_input(&mut self) {
         loop {
             match self.poll() {
                 Some(MonomeEvent::GridKey { x, y, direction }) => match direction {
@@ -762,25 +764,25 @@ impl MLR {
             }
         }
     }
-    fn render(&mut self) {
+    pub fn render(&mut self) {
         self.update_leds();
     }
 }
 
-struct MLRRenderer {
+pub struct MLRRenderer {
     tracks: Vec<MLRTrack>,
-    rx: std::sync::Arc<Mutex<std::sync::mpsc::Receiver<Message>>>,
+    rx: sync::Arc<Mutex<sync::mpsc::Receiver<Message>>>,
 }
 
 impl MLRRenderer {
     fn new(
         tracks: Vec<MLRTrack>,
-        rx: std::sync::Arc<Mutex<std::sync::mpsc::Receiver<Message>>>,
+        rx: sync::Arc<Mutex<sync::mpsc::Receiver<Message>>>,
     ) -> MLRRenderer {
         MLRRenderer { tracks, rx }
     }
 
-    fn render(&mut self, output: &mut [f32]) {
+    pub fn render(&mut self, output: &mut [f32]) {
         let mut m = Mixer::new(output);
         loop {
             match self.rx.lock().unwrap().try_recv() {
@@ -863,8 +865,8 @@ impl MLRRenderer {
                     }
                 },
                 Err(err) => match err {
-                    std::sync::mpsc::TryRecvError::Empty => {}
-                    std::sync::mpsc::TryRecvError::Disconnected => {
+                    sync::mpsc::TryRecvError::Empty => {}
+                    sync::mpsc::TryRecvError::Disconnected => {
                         error!("disconnected");
                     }
                 },
@@ -877,47 +879,5 @@ impl MLRRenderer {
                 break;
             }
         }
-    }
-}
-
-fn main() {
-    pretty_env_logger::init();
-
-    let (mut clock_updater, clock_receiver) = audio_clock(128., 48000);
-
-    let (mut mlr, mut renderer) = MLR::new(clock_receiver);
-
-    // set up audio output
-    let ctx = cubeb::init("mlr-rs").expect("Failed to create cubeb context");
-    let params = cubeb::StreamParamsBuilder::new()
-        .format(cubeb::SampleFormat::Float32NE)
-        .rate(48000)
-        .channels(1)
-        .layout(cubeb::ChannelLayout::MONO)
-        .take();
-
-    let mut builder = cubeb::StreamBuilder::new();
-    builder
-        .name("mlr-rs")
-        .default_output(&params)
-        .latency(256)
-        .data_callback(move |_input: &[f32], output| {
-            renderer.render(output);
-            clock_updater.increment(output.len());
-            output.len() as isize
-        })
-        .state_callback(|state| {
-            info!("stream {:?}", state);
-        });
-
-    let stream = builder.init(&ctx).expect("Failed to create cubeb stream");
-
-    stream.start().unwrap();
-
-    loop {
-        mlr.main_thread_work();
-        mlr.poll_input();
-        mlr.render();
-        thread::sleep(Duration::from_millis(1));
     }
 }

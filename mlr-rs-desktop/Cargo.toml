@@ -1,0 +1,12 @@
+[package]
+name = "mlr-rs-desktop"
+version = "0.1.0"
+authors = ["Paul Adenot <paul@paul.cx>"]
+
+
+[dependencies]
+mlr-rs = { version = "0.1", path = "../" }
+cubeb = "0.5.2"
+audio-clock = "0.2.0"
+log = "0.4.2"
+pretty_env_logger = "0.2.3"
