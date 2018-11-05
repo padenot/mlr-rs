@@ -10,13 +10,54 @@ use bela::*;
 use mlr_rs::{MLR, MLRRenderer};
 use audio_clock::*;
 
-fn go() -> Result<bool, bela::error::Error> {
-    let (mut clock_updater, clock_receiver) = audio_clock(128., 44100);
+struct MonomeTask<F> {
+    callback: F,
+    args: MLR
+}
 
-    let (mut mlr, renderer) = MLR::new(clock_receiver);
+impl<F> Auxiliary for MonomeTask<F>
+where F: FnMut(&mut MLR),
+      for<'r> F: FnMut(&'r mut MLR)
+{
+    type Args = MLR;
+
+    fn destructure(&mut self) -> (&mut FnMut(&mut MLR), &mut Self::Args) {
+        let MonomeTask {
+            callback,
+            args,
+        } = self;
+
+        (callback, args)
+    }
+}
+
+type BelaApp<'a> = Bela<AppData<'a, MLRRenderer>>;
+
+fn go() -> Result<(), bela::error::Error> {
+    let (mut clock_updater, clock_receiver) = audio_clock(128., 44100);
+    println!("loading samples & decoding...");
+
+    let (mlr, renderer) = MLR::new(clock_receiver);
+
+    println!("ok!");
+
+    let mut monome_task = MonomeTask {
+        callback: |mlr: &mut MLR| {
+            loop {
+                mlr.main_thread_work();
+                mlr.poll_input();
+                mlr.render();
+                thread::sleep(Duration::from_millis(16));
+            }
+        },
+        args: mlr
+    };
 
     let mut setup = |_context: &mut Context, _user_data: &mut MLRRenderer| -> Result<(), error::Error> {
         println!("Setting up");
+        let task = BelaApp::create_auxiliary_task(&mut monome_task, 10, "monome_task");
+        BelaApp::schedule_auxiliary_task(&task)?;
+        println!("ok");
         Ok(())
     };
 
@@ -26,7 +67,6 @@ fn go() -> Result<bool, bela::error::Error> {
 
     let mut render = |context: &mut Context, renderer: &mut MLRRenderer| {
         let frames = context.audio_frames();
-        let rate = context.audio_sample_rate();
         let output = context.audio_out();
         let mut out: [f32; 16] = [0.0; 16];
         renderer.render(&mut out);
@@ -38,20 +78,10 @@ fn go() -> Result<bool, bela::error::Error> {
     };
 
     let user_data = AppData::new(renderer, &mut render, Some(&mut setup), Some(&mut cleanup));
-    let mut bela_app = Bela::new(user_data);
+
     let mut settings = InitSettings::default();
-    bela_app.init_audio(&mut settings)?;
-    bela_app.start_audio()?;
 
-    loop {
-        mlr.main_thread_work();
-        mlr.poll_input();
-        mlr.render();
-        thread::sleep(Duration::from_millis(16));
-    }
-
-    bela_app.stop_audio();
-    bela_app.cleanup_audio();
+    Bela::new(user_data).run(&mut settings)
 }
 
 fn main() {
