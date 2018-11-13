@@ -5,6 +5,8 @@ extern crate audio_clock;
 extern crate chrono;
 extern crate monome;
 extern crate timer;
+extern crate mbms_traits;
+extern crate bela;
 
 use audrey::*;
 use audio_clock::*;
@@ -22,7 +24,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use mbms_traits::*;
 use monome::{KeyDirection, Monome, MonomeEvent};
+use bela::Context;
 
 struct MLRSample {
     name: String,
@@ -473,7 +477,8 @@ pub struct MLR {
 }
 
 impl MLR {
-    pub fn new(audio_clock: ClockConsumer) -> (MLR, MLRRenderer) {
+    pub fn new(tempo: f32, rate: u32) -> (MLR, MLRRenderer) {
+        let (clock_updater, clock_consumer) = audio_clock(tempo, rate);
         let (sender, receiver) = channel::<Message>();
         let rx = Arc::new(Mutex::new(receiver));
 
@@ -503,7 +508,7 @@ impl MLR {
             row += 1;
         }
 
-        let mut renderer = MLRRenderer::new(tracks, rx);
+        let mut renderer = MLRRenderer::new(tracks, rx, clock_updater);
 
         let state_tracker = GridStateTracker::new(16, 8);
 
@@ -519,7 +524,7 @@ impl MLR {
                 previous_time: 0,
                 leds,
                 monome,
-                audio_clock,
+                audio_clock: clock_consumer,
                 pattern: Vec::new(),
                 recording_end: None,
                 pattern_duration_frames: (60. / 128. * 4. * 48000.) as usize,
@@ -532,11 +537,11 @@ impl MLR {
             renderer,
         )
     }
-    fn track_length(&self) -> u32 {
-        self.monome.width() as u32
+    fn track_length(&self) -> usize {
+        self.monome.width()
     }
-    fn track_max(&self) -> u32 {
-        self.monome.height() as u32
+    fn track_max(&self) -> usize {
+        self.monome.height()
     }
     fn start(&mut self, track_index: usize) {
         if !self.tracks_meta[track_index].enabled() {
@@ -588,41 +593,18 @@ impl MLR {
     fn track_loaded(&mut self, track_index: usize) -> bool {
         track_index < self.tracks_meta.len()
     }
-    fn start_recording(&mut self, pattern_index: usize) {
-        self.monome.set(14 + pattern_index as i32, 0, true);
-    }
-    fn end_recording(&mut self, pattern_index: usize) {
-        self.monome.set(14 + pattern_index as i32, 0, 8);
-    }
-    fn update_leds(&mut self) {
+    fn update_leds(&mut self, grid: &mut [u8; 128]) {
         if self.recording_pattern {
-            self.monome.set(14, 0, true);
-        }
-        if self.recording_pattern {
-            self.monome.set(14, 0, true);
+            grid[14] = 15;
         }
         let current_time = self.audio_clock.raw_frames();
         let diff = (current_time - self.previous_time) as isize;
-        for t in self.tracks_meta.iter_mut() {
-            t.update_pos(diff);
-            if t.enabled() {
-                let current_led = t.current_led();
-                if self.leds[t.row_index()] != current_led as i32 && t.enabled() {
-                    self.monome.set(
-                        self.leds[t.row_index()] as i32,
-                        t.row_index() as i32 + 1,
-                        false,
-                    );
-                    self.leds[t.row_index()] = current_led as i32;
-                    self.monome
-                        .set(t.current_led() as i32, t.row_index() as i32 + 1, true);
-                }
-            }
+        for i in 0..self.tracks_meta.len() {
+            self.tracks_meta[i].update_pos(diff);
+            let idx: usize = (i+1) * self.track_length() + self.tracks_meta[i].current_led() as usize;
+            grid[idx] = 15;
         }
         self.previous_time = current_time;
-    }
-    fn poll(&mut self) -> Option<MonomeEvent> {
-        self.monome.poll()
     }
     fn handle_action(&mut self, action: MLRAction) {
         // If recording pattern but button has been pressed, stop recording a pattern.
@@ -695,7 +677,10 @@ impl MLR {
             MLRAction::Nothing => {}
         }
     }
-    pub fn main_thread_work(&mut self) {
+}
+
+impl InstrumentControl for MLR {
+    fn main_thread_work(&mut self) {
         if self.pattern_playback {
             debug!(
                 "pattern[{}].begin: {:?}, offset: {}, end: {}",
@@ -743,46 +728,40 @@ impl MLR {
         }
     }
 
-    pub fn poll_input(&mut self) {
-        loop {
-            match self.poll() {
-                Some(MonomeEvent::GridKey { x, y, direction }) => match direction {
-                    KeyDirection::Down => {
-                        self.state_tracker.down(x as usize, y as usize);
-                    }
-                    KeyDirection::Up => {
-                        let action = self.state_tracker.up(x as usize, y as usize);
-                        self.handle_action(action);
-                    }
-                },
-                Some(_) => {
-                    break;
+    fn input(&mut self, event: MonomeEvent) {
+        match event {
+            MonomeEvent::GridKey { x, y, direction } => match direction {
+                KeyDirection::Down => {
+                    self.state_tracker.down(x as usize, y as usize);
                 }
-                None => {
-                    break;
+                KeyDirection::Up => {
+                    let action = self.state_tracker.up(x as usize, y as usize);
+                    self.handle_action(action);
                 }
             }
+            _ => { }
         }
     }
-    pub fn render(&mut self) {
-        self.update_leds();
+    fn render(&mut self, grid: &mut [u8; 128]) {
+        self.update_leds(grid);
     }
 }
 
 pub struct MLRRenderer {
     tracks: Vec<MLRTrack>,
     rx: sync::Arc<Mutex<sync::mpsc::Receiver<Message>>>,
+    clock_updater: ClockUpdater
 }
 
 impl MLRRenderer {
     fn new(
         tracks: Vec<MLRTrack>,
         rx: sync::Arc<Mutex<sync::mpsc::Receiver<Message>>>,
+        clock_updater: ClockUpdater,
     ) -> MLRRenderer {
-        MLRRenderer { tracks, rx }
+        MLRRenderer { tracks, rx, clock_updater }
     }
-
-    pub fn render(&mut self, output: &mut [f32]) {
+    fn render_audio(&mut self, output: &mut [f32]) {
         let mut m = Mixer::new(output);
         loop {
             match self.rx.lock().unwrap().try_recv() {
@@ -879,5 +858,19 @@ impl MLRRenderer {
                 break;
             }
         }
+    }
+}
+
+impl InstrumentRenderer for MLRRenderer {
+    fn render(&mut self, context: &mut Context) {
+        let frames = context.audio_frames();
+        let output = context.audio_out();
+        let mut out: [f32; 16] = [0.0; 16];
+        self.render_audio(&mut out);
+        for i in 0..16 {
+            output[i * 2] = out[i];
+            output[i * 2 + 1] = 0.;
+        }
+        self.clock_updater.increment(frames * 2);
     }
 }

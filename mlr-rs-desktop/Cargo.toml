@@ -5,7 +5,7 @@ authors = ["Paul Adenot <paul@paul.cx>"]
 
 
 [dependencies]
-mlr-rs = { version = "0.1", path = "../" }
+mlr-rs = { version = "0.1", path = "../mlr-rs" }
 cubeb = "0.5.2"
 audio-clock = "0.2.0"
 log = "0.4.2"

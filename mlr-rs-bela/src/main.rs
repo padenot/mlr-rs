@@ -1,27 +1,35 @@
 extern crate log;
 extern crate mlr_rs;
-extern crate audio_clock;
 extern crate bela;
 extern crate pretty_env_logger;
+extern crate mbms_traits;
+extern crate monome;
+
 use std::thread;
 use std::time::Duration;
 
 use bela::*;
 use mlr_rs::{MLR, MLRRenderer};
-use audio_clock::*;
+use mbms_traits::*;
+use monome::*;
+
+struct Control {
+    mlr: MLR,
+    monome: Monome
+}
 
 struct MonomeTask<F> {
     callback: F,
-    args: MLR
+    args: Control
 }
 
 impl<F> Auxiliary for MonomeTask<F>
-where F: FnMut(&mut MLR),
-      for<'r> F: FnMut(&'r mut MLR)
+where F: FnMut(&mut Control),
+      for<'r> F: FnMut(&'r mut Control)
 {
-    type Args = MLR;
+    type Args = Control;
 
-    fn destructure(&mut self) -> (&mut FnMut(&mut MLR), &mut Self::Args) {
+    fn destructure(&mut self) -> (&mut FnMut(&mut Control), &mut Self::Args) {
         let MonomeTask {
             callback,
             args,
@@ -34,23 +42,36 @@ where F: FnMut(&mut MLR),
 type BelaApp<'a> = Bela<AppData<'a, MLRRenderer>>;
 
 fn go() -> Result<(), bela::error::Error> {
-    let (mut clock_updater, clock_receiver) = audio_clock(128., 44100);
     println!("loading samples & decoding...");
 
-    let (mlr, renderer) = MLR::new(clock_receiver);
+    let (mlr, renderer) = MLR::new(128., 44100);
+    let monome = Monome::new("/prefix".to_string()).unwrap();
 
     println!("ok!");
 
+
     let mut monome_task = MonomeTask {
-        callback: |mlr: &mut MLR| {
+        callback: |control: &mut Control| {
+            let mut grid = [0 as u8; 128];
+            let monome = &mut control.monome;
+            let mlr = &mut control.mlr;
             loop {
+                match monome.poll() {
+                    Some(e) => {
+                        mlr.input(e);
+                    }
+                    _ => { }
+                }
                 mlr.main_thread_work();
-                mlr.poll_input();
-                mlr.render();
+                mlr.render(&mut grid);
+                monome.set_all_intensity(&grid.to_vec());
+
+                grid.iter_mut().map(|x| *x = 0).count();
+
                 thread::sleep(Duration::from_millis(16));
             }
         },
-        args: mlr
+        args: Control { mlr, monome }
     };
 
     let mut setup = |_context: &mut Context, _user_data: &mut MLRRenderer| -> Result<(), error::Error> {
@@ -66,15 +87,7 @@ fn go() -> Result<(), bela::error::Error> {
     };
 
     let mut render = |context: &mut Context, renderer: &mut MLRRenderer| {
-        let frames = context.audio_frames();
-        let output = context.audio_out();
-        let mut out: [f32; 16] = [0.0; 16];
-        renderer.render(&mut out);
-        for i in 0..16 {
-            output[i * 2] = out[i];
-            output[i * 2 + 1] = out[i];
-        }
-        clock_updater.increment(frames * 2);
+        renderer.render(context);
     };
 
     let user_data = AppData::new(renderer, &mut render, Some(&mut setup), Some(&mut cleanup));

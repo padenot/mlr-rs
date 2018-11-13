@@ -10,6 +10,8 @@ audio-clock = "0.2.0"
 log = "0.4.2"
 pretty_env_logger = "0.2.3"
 bela = { path = "../../bela-rs" }
+mbms-traits = { path = "../../mbms-traits/" }
+monome-rs = "0.1.2"
 
 [profile.release]
 lto = true
