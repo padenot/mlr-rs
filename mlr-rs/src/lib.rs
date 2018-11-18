@@ -109,6 +109,7 @@ struct MLRTrackMetadata {
     direction: PlaybackDirection,
     frames: isize,
     name: String,
+    ever_played: bool
 }
 
 impl MLRTrackMetadata {
@@ -133,7 +134,11 @@ impl MLRTrackMetadata {
     fn enabled(&self) -> bool {
         self.playing
     }
+    fn ever_played(&self) -> bool {
+        self.ever_played
+    }
     fn start(&mut self) {
+        self.ever_played = true;
         self.playing = true;
     }
     fn stop(&mut self) {
@@ -146,6 +151,7 @@ impl MLRTrackMetadata {
         self.stop_index = index;
     }
     fn set_head(&mut self, index: isize) {
+        self.ever_played = true;
         self.current_pos = self.index_to_frames(index);
     }
     fn set_direction(&mut self, direction: PlaybackDirection) {
@@ -198,6 +204,7 @@ impl MLRTrack {
             frames: self.sample.frames() as isize,
             direction: PlaybackDirection::FORWARD,
             name: self.name().clone().to_string(),
+            ever_played: false
         }
     }
     fn start(&mut self) {
@@ -370,29 +377,16 @@ impl GridStateTracker {
     }
     fn up(&mut self, x: usize, y: usize) -> MLRAction {
         if y == 0 {
-            // control row
-            // is mod 1 (8th button) or mod 2 (9th button) down
-            let mut gain_delta = 0;
-            if self.buttons[Self::idx(self.width, 7, y)] != MLRIntent::Nothing {
-                gain_delta = -1;
-            }
-            if self.buttons[Self::idx(self.width, 8, y)] != MLRIntent::Nothing {
-                gain_delta = 1;
-            }
-            if gain_delta != 0 {
-                self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Nothing;
-                return MLRAction::GainChange((x, gain_delta));
-            }
-            if self.buttons[Self::idx(self.width, 14, y)] != MLRIntent::Nothing {
+            // 0 to 7 are system buttons.
+            // 8 to 14 are enable/disable of tracks
+            // 15 triggers pattern
+            if self.buttons[Self::idx(self.width, 15, y)] != MLRIntent::Nothing {
                 self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Nothing;
                 return MLRAction::Pattern(0);
             }
-            if self.buttons[Self::idx(self.width, 15, y)] != MLRIntent::Nothing {
-                self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Nothing;
-                return MLRAction::Pattern(1);
-            }
             self.buttons[Self::idx(self.width, x, y)] = MLRIntent::Nothing;
-            MLRAction::TrackStatus(x)
+            // offset by 8 to find the track index
+            MLRAction::TrackStatus(x - 8)
         } else {
             // tracks rows
             match self.buttons[Self::idx(self.width, x, y)].clone() {
@@ -595,14 +589,28 @@ impl MLR {
     }
     fn update_leds(&mut self, grid: &mut [u8; 128]) {
         if self.recording_pattern {
-            grid[14] = 15;
+            grid[15] = 15;
+        }
+        if self.pattern_playback {
+            grid[15] = 8;
         }
         let current_time = self.audio_clock.raw_frames();
         let diff = (current_time - self.previous_time) as isize;
+        let track_length = self.track_length();
         for i in 0..self.tracks_meta.len() {
-            self.tracks_meta[i].update_pos(diff);
-            let idx: usize = (i+1) * self.track_length() + self.tracks_meta[i].current_led() as usize;
-            grid[idx] = 15;
+            let t = &mut self.tracks_meta[i];
+            t.update_pos(diff);
+            let idx: usize = (i+1) * track_length + t.current_led() as usize;
+            grid[idx] = if t.ever_played() { 15 } else { 0 };
+            grid[8 + i] = if t.enabled() {
+                15
+            } else {
+                if t.ever_played() {
+                    5
+                } else {
+                    0
+                }
+            };
         }
         self.previous_time = current_time;
     }
