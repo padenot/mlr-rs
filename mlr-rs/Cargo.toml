@@ -5,7 +5,7 @@ authors = ["Paul Adenot <paul@paul.cx>"]
 
 [dependencies]
 audrey = "0.2.0"
-monome-rs = "0.1.2"
+monome-rs = { path = "../../monome-rs" }
 log = "0.4.2"
 pretty_env_logger = "0.2.3"
 timer = "0.2"
