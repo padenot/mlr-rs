@@ -594,12 +594,9 @@ impl MLR {
         if self.pattern_playback {
             grid[15] = 8;
         }
-        let current_time = self.audio_clock.raw_frames();
-        let diff = (current_time - self.previous_time) as isize;
         let track_length = self.track_length();
         for i in 0..self.tracks_meta.len() {
             let t = &mut self.tracks_meta[i];
-            t.update_pos(diff);
             let idx: usize = (i+1) * track_length + t.current_led() as usize;
             grid[idx] = if t.ever_played() { 15 } else { 0 };
             grid[8 + i] = if t.enabled() {
@@ -612,7 +609,6 @@ impl MLR {
                 }
             };
         }
-        self.previous_time = current_time;
     }
     fn handle_action(&mut self, action: MLRAction) {
         // If recording pattern but button has been pressed, stop recording a pattern.
@@ -689,6 +685,14 @@ impl MLR {
 
 impl InstrumentControl for MLR {
     fn main_thread_work(&mut self) {
+        let current_time = self.audio_clock.raw_frames();
+        let diff = (current_time - self.previous_time) as isize;
+        for i in 0..self.tracks_meta.len() {
+            let t = &mut self.tracks_meta[i];
+            t.update_pos(diff);
+        }
+        self.previous_time = current_time;
+
         if self.pattern_playback {
             debug!(
                 "pattern[{}].begin: {:?}, offset: {}, end: {}",
