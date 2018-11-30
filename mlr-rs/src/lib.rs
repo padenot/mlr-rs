@@ -471,7 +471,7 @@ pub struct MLR {
 }
 
 impl MLR {
-    pub fn new(tempo: f32, rate: u32) -> (MLR, MLRRenderer) {
+    pub fn new(out_port: BelaPort, tempo: f32, rate: u32) -> (MLR, MLRRenderer) {
         let (clock_updater, clock_consumer) = audio_clock(tempo, rate);
         let (sender, receiver) = channel::<Message>();
         let rx = Arc::new(Mutex::new(receiver));
@@ -502,7 +502,15 @@ impl MLR {
             row += 1;
         }
 
-        let mut renderer = MLRRenderer::new(tracks, rx, clock_updater);
+        let mut channel = 0;
+        match out_port {
+            BelaPort::AudioOut(i) => {
+              channel = i;
+            },
+            _ => { panic!("wrong type of BelaPort"); }
+        }
+
+        let mut renderer = MLRRenderer::new(tracks, rx, clock_updater, channel);
 
         let state_tracker = GridStateTracker::new(16, 8);
 
@@ -762,7 +770,8 @@ impl InstrumentControl for MLR {
 pub struct MLRRenderer {
     tracks: Vec<MLRTrack>,
     rx: sync::Arc<Mutex<sync::mpsc::Receiver<Message>>>,
-    clock_updater: ClockUpdater
+    clock_updater: ClockUpdater,
+    channel: usize
 }
 
 impl MLRRenderer {
@@ -770,8 +779,9 @@ impl MLRRenderer {
         tracks: Vec<MLRTrack>,
         rx: sync::Arc<Mutex<sync::mpsc::Receiver<Message>>>,
         clock_updater: ClockUpdater,
+        channel: usize
     ) -> MLRRenderer {
-        MLRRenderer { tracks, rx, clock_updater }
+        MLRRenderer { tracks, rx, clock_updater, channel }
     }
     fn render_audio(&mut self, output: &mut [f32]) {
         let mut m = Mixer::new(output);
@@ -880,8 +890,7 @@ impl InstrumentRenderer for MLRRenderer {
         let mut out: [f32; 16] = [0.0; 16];
         self.render_audio(&mut out);
         for i in 0..16 {
-            output[i * 2] = out[i];
-            output[i * 2 + 1] = 0.;
+            output[i * 2 + self.channel] = out[i];
         }
         self.clock_updater.increment(frames * 2);
     }
