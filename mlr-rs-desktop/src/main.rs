@@ -13,9 +13,7 @@ use audio_clock::*;
 fn main() {
     pretty_env_logger::init();
 
-    let (mut clock_updater, clock_receiver) = audio_clock(128., 48000);
-
-    let (mut mlr, mut renderer) = MLR::new(clock_receiver);
+    let (mut mlr, mut renderer) = MLR::new(128., 48000);
 
     // set up audio output
     let ctx = cubeb::init("mlr-rs").expect("Failed to create cubeb context");
@@ -32,8 +30,8 @@ fn main() {
         .default_output(&params)
         .latency(256)
         .data_callback(move |_input: &[f32], output| {
-            renderer.render(output);
-            clock_updater.increment(output.len());
+            renderer.render_audio(output);
+            renderer.update_clock(output.len());
             output.len() as isize
         })
         .state_callback(|state| {
@@ -46,8 +44,8 @@ fn main() {
 
     loop {
         mlr.main_thread_work();
-        mlr.poll_input();
+        mlr.handle_inputs();
         mlr.render();
-        thread::sleep(Duration::from_millis(1));
+        thread::sleep(Duration::from_millis(10));
     }
 }

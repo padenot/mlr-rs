@@ -49,7 +49,6 @@ fn go() -> Result<(), bela::error::Error> {
 
     println!("ok!");
 
-
     let mut monome_task = MonomeTask {
         callback: |control: &mut Control| {
             let mut grid = [0 as u8; 128];
@@ -63,7 +62,7 @@ fn go() -> Result<(), bela::error::Error> {
                     _ => { }
                 }
                 mlr.main_thread_work();
-                mlr.render(&mut grid);
+                mlr.render_framebuffer(&mut grid);
                 monome.set_all_intensity(&grid.to_vec());
 
                 grid.iter_mut().map(|x| *x = 0).count();
@@ -87,7 +86,10 @@ fn go() -> Result<(), bela::error::Error> {
     };
 
     let mut render = |context: &mut Context, renderer: &mut MLRRenderer| {
-        renderer.render(context);
+        let frames = context.audio_frames();
+        let mut output = context.audio_out();
+        renderer.render_audio(&mut output);
+        renderer.update_clock(frames * 2);
     };
 
     let user_data = AppData::new(renderer, &mut render, Some(&mut setup), Some(&mut cleanup));
